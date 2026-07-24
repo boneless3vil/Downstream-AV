@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Downstream",
-  "version": "1.1",
+  "version": "1.2",
   "description": "Send YouTube, Instagram, and Threads videos to Downstream with one click",
   "permissions": [
     "contextMenus",
     "activeTab",
     "scripting",
-    "storage"
+    "storage",
+    "nativeMessaging"
   ],
   "host_permissions": [
     "*://*.youtube.com/*",

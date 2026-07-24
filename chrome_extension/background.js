@@ -95,6 +95,57 @@ function notifyTab(tabId, action, message) {
 
 // Must match API_PORT in downstream.py and manifest host_permissions
 const API_URL = 'http://localhost:47811/api/download';
+const API_STATUS_URL = 'http://localhost:47811/';
+
+// Native messaging host that starts the desktop app when it isn't running
+// (registered in the OS by native_host/register_host.ps1)
+const LAUNCHER_HOST = 'com.boneless3vil.downstream_launcher';
+
+async function isAppRunning() {
+  try {
+    return (await fetch(API_STATUS_URL)).ok;
+  } catch {
+    return false;
+  }
+}
+
+// Ask the native host to start Downstream, then wait for its API to come up.
+// The launcher exits without replying, so sendNativeMessage always reports an
+// error - that's expected and ignored; polling the API is the real signal.
+// The wait is generous: the packaged exe unpacks itself before starting.
+async function launchAppAndWait() {
+  chrome.action.setBadgeBackgroundColor({ color: '#1565c0' });
+  chrome.action.setBadgeText({ text: '…' });
+  chrome.action.setTitle({ title: 'Starting Downstream...' });
+  try {
+    await chrome.runtime.sendNativeMessage(LAUNCHER_HOST, { action: 'launch' });
+  } catch { /* expected: the launcher never replies */ }
+  for (let i = 0; i < 45; i++) {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    if (await isAppRunning()) return true;
+  }
+  return false;
+}
+
+async function postDownload(url) {
+  const preferences = await getPreferences();
+  const response = await fetch(API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, settings: preferences })
+  });
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    // Something answered, but not with our API's JSON
+    throw new Error('Another program is answering on the downloader\'s port');
+  }
+  if (!data.success) {
+    throw new Error(data.error || 'Download failed');
+  }
+  return data;
+}
 
 // Pages the desktop app can download from (keep in sync with
 // SUPPORTED_URL_RE / AUTO_FETCH_RE in downstream.py)
@@ -111,33 +162,27 @@ async function startDownload(url, tabId) {
     return { success: false, error: 'Not a supported video page' };
   }
   try {
-    const preferences = await getPreferences();
-    const response = await fetch(API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, settings: preferences })
-    });
     let data;
     try {
-      data = await response.json();
-    } catch {
-      // Something answered, but not with our API's JSON
-      throw new Error('Another program is answering on the downloader\'s port');
-    }
-    if (!data.success) {
-      throw new Error(data.error || 'Download failed');
+      data = await postDownload(url);
+    } catch (error) {
+      // "Failed to fetch" = nothing listening on the API port: start the
+      // desktop app ourselves and retry once
+      if (!String(error.message).includes('Failed to fetch')) {
+        throw error;
+      }
+      if (!await launchAppAndWait()) {
+        throw new Error('Could not start Downstream - start it manually');
+      }
+      data = await postDownload(url);
     }
     flashBadge('✓', '#2e7d32', 'Download started');
     notifyTab(tabId, 'downloadStarted', 'Download started successfully');
     return data;
   } catch (error) {
-    // "Failed to fetch" = nothing listening on the API port
-    const hint = String(error.message).includes('Failed to fetch')
-      ? 'Desktop app is not running - start Downstream first'
-      : error.message;
-    flashBadge('✗', '#c62828', 'Download failed: ' + hint);
-    notifyTab(tabId, 'downloadError', hint);
-    return { success: false, error: hint };
+    flashBadge('✗', '#c62828', 'Download failed: ' + error.message);
+    notifyTab(tabId, 'downloadError', error.message);
+    return { success: false, error: error.message };
   }
 }
 

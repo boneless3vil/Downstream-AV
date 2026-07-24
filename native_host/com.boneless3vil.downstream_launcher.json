@@ -1,0 +1,9 @@
+{
+  "name": "com.boneless3vil.downstream_launcher",
+  "description": "Starts the Downstream desktop app for the browser extension",
+  "path": "C:\\bin\\Downstream\\native_host\\downstream_launcher.bat",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://hodjlfplfloknoiibgdajbaldodjbhnn/"
+  ]
+}
