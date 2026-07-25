@@ -21,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 APP_NAME = "Downstream"
-APP_VERSION = "1.6.4"
+APP_VERSION = "1.6.5"
 
 def get_base_path():
     """Get base path for resources, works both in development and when packaged"""
@@ -350,6 +350,9 @@ class DownstreamApp:
             # Settings lives in the window's native title-bar menu (the icon
             # at the top left); deferred until the window exists on screen
             self.root.after(200, self.add_settings_to_system_menu)
+            # A port bind failure surfaces within Flask's first moments;
+            # checking a few seconds in is late enough to catch it
+            self.root.after(3000, self._warn_if_port_conflict)
             logger.debug("GUI setup completed successfully")
         except Exception as e:
             logger.error(f"Error in setup_gui: {str(e)}", exc_info=True)
@@ -373,6 +376,7 @@ class DownstreamApp:
     # App-defined WM_SYSCOMMAND ids must be < 0xF000
     SYSMENU_SETTINGS_ID = 0x1000
     SYSMENU_HISTORY_ID = 0x1010
+    SYSMENU_OPENFOLDER_ID = 0x1020
 
     def add_settings_to_system_menu(self):
         """Append Settings... and Download History... to the native
@@ -412,6 +416,8 @@ class DownstreamApp:
             self._sysmenu_actions = {
                 self.SYSMENU_SETTINGS_ID: ("Settings...", self.show_settings),
                 self.SYSMENU_HISTORY_ID: ("Download History...", self.show_history),
+                self.SYSMENU_OPENFOLDER_ID: ("Open Download Folder",
+                                             self.open_download_folder),
             }
             sysmenu = user32.GetSystemMenu(hwnd, False)
             user32.AppendMenuW(sysmenu, MF_SEPARATOR, 0, None)
@@ -464,6 +470,8 @@ class DownstreamApp:
         app_menu = tk.Menu(menubar, tearoff=0)
         app_menu.add_command(label="Settings...", command=self.show_settings)
         app_menu.add_command(label="Download History...", command=self.show_history)
+        app_menu.add_command(label="Open Download Folder",
+                             command=self.open_download_folder)
         menubar.add_cascade(label="Menu", menu=app_menu)
         self.root.config(menu=menubar)
 
@@ -627,6 +635,16 @@ class DownstreamApp:
         self.status_var = tk.StringVar(value="Ready")
         self.status_label = ttk.Label(progress_frame, textvariable=self.status_var)
         self.status_label.pack(anchor=tk.W, pady=(2, 0))
+
+    def _warn_if_port_conflict(self):
+        """Tell the user when the extension API port couldn't be bound.
+
+        Only overwrite an idle status bar - never an in-flight download's.
+        """
+        if api_port_conflict.is_set() and self.status_var.get() == "Ready":
+            self.status_var.set(
+                "Extension port busy - is another copy of Downstream running?")
+            self.flash_status()
 
     def flash_status(self, flashes=3, interval=250):
         """Flash the status label red the given number of times, then
@@ -935,7 +953,7 @@ class DownstreamApp:
                 if total > 0:
                     progress = (downloaded / total) * 100
                     self.root.after(0, self.progress_var.set, progress)
-            except:
+            except Exception:
                 pass
 
     def load_settings(self):
@@ -975,7 +993,7 @@ class DownstreamApp:
             clipboard_content = pyperclip.paste()
             if SUPPORTED_URL_RE.search(clipboard_content or ""):
                 self.url_var.set(clipboard_content)
-        except:
+        except Exception:
             pass
 
     def show_settings(self):
@@ -1063,19 +1081,35 @@ class DownstreamApp:
                                                       auto_var, quality_var,
                                                       settings_window)).pack()
 
+    def open_download_folder(self):
+        """Show the destination folder in the file manager."""
+        path = self.settings["download_path"]
+        try:
+            if os.name == 'nt':
+                os.startfile(path)
+            else:
+                import subprocess
+                subprocess.Popen(['xdg-open', path])
+        except OSError:
+            messagebox.showerror("Error", f"Could not open folder:\n{path}")
+
     def browse_path(self, path_var):
         path = filedialog.askdirectory(
             initialdir=path_var.get() or self.settings["download_path"])
         if path:
             path_var.set(path)
 
+    # Several download threads can finish at once; serialize their appends
+    # so history lines can't interleave
+    _history_lock = threading.Lock()
+
     def log_download(self, url, download_type, status):
         try:
             log_path = os.path.join(self.base_path, "download_history.log")
-            with open(log_path, "a") as f:
+            with self._history_lock, open(log_path, "a") as f:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 f.write(f"{timestamp} | {download_type} | {url} | {status}\n")
-        except:
+        except Exception:
             pass
 
     def show_history(self):
@@ -1095,7 +1129,7 @@ class DownstreamApp:
             with open(os.path.join(self.base_path, "download_history.log"), "r") as f:
                 history = f.read()
                 text_widget.insert(tk.END, history)
-        except:
+        except OSError:
             text_widget.insert(tk.END, "No download history available.")
 
         text_widget.configure(state=tk.DISABLED)
@@ -1180,6 +1214,11 @@ def api_download():
 API_PORT = 47811
 
 
+# Set when the API port can't be bound so the GUI can tell the user why the
+# browser extension won't work this session
+api_port_conflict = threading.Event()
+
+
 def run_flask():
     # Bind to localhost only: the API is meant for the local Chrome extension,
     # exposing it on all interfaces would let anyone on the network trigger downloads
@@ -1187,6 +1226,7 @@ def run_flask():
         flask_app.run(host='127.0.0.1', port=API_PORT)
     except OSError:
         # Port taken: GUI downloads still work, only the extension is affected
+        api_port_conflict.set()
         logger.critical(
             f"Could not bind 127.0.0.1:{API_PORT} - is another copy of the "
             "app running? The Chrome extension will not work this session.",
@@ -1240,7 +1280,7 @@ def main():
             # Try to show error in GUI if possible, otherwise use console
             try:
                 messagebox.showerror("Fatal Error", error_msg)
-            except:
+            except Exception:
                 print("FATAL ERROR:", error_msg)
             sys.exit(1)
 
@@ -1253,10 +1293,10 @@ def main():
         logger.error(f"Application error: {str(e)}", exc_info=True)
         if not isinstance(e, SystemExit):
             try:
-                messagebox.showerror("Fatal Error", 
+                messagebox.showerror("Fatal Error",
                                    f"Application failed to start: {str(e)}\n\n"
                                    "Please check the logs for more details.")
-            except:
+            except Exception:
                 print("FATAL ERROR:", str(e))
         sys.exit(1)
 
