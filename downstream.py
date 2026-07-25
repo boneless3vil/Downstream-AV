@@ -21,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 APP_NAME = "Downstream"
-APP_VERSION = "1.6.3"
+APP_VERSION = "1.6.4"
 
 def get_base_path():
     """Get base path for resources, works both in development and when packaged"""
@@ -963,7 +963,7 @@ class DownstreamApp:
         # Apply the new default to the main window immediately
         self.download_type.set(type_var.get())
         settings_window.destroy()
-        messagebox.showinfo("Success", "Settings saved!")
+        self.status_var.set("Settings saved")
 
     def save_settings_file(self):
         settings_path = os.path.join(self.base_path, "settings.json")
