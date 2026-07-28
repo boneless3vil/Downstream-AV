@@ -143,6 +143,19 @@ class ThreadsIE(InfoExtractor):
                     traverse_obj(response, 'errorSummary') or response['error']),
                 expected=True)
 
+        # Relay failures come back as errors=[{message, severity}, ...] with
+        # data=null (note the plural key, unlike the platform-level 'error'
+        # above). Seen for deleted and login-restricted posts.
+        if response.get('data') is None:
+            raise ExtractorError(
+                'Threads reports this post as unavailable ({}) - it may be '
+                'deleted or restricted to logged-in users. If you can open it '
+                'in your browser, configure that browser for cookies '
+                '(Settings > Instagram/Threads login)'.format(
+                    traverse_obj(response, ('errors', 0, 'message'))
+                    or 'no details'),
+                expected=True)
+
         formats = []
         thumbnails = []
         metadata = {'id': video_id}

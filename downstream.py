@@ -178,6 +178,10 @@ def run_with_cookie_fallback(ydl_opts, action):
     and locks the file, or uses cookie encryption yt-dlp can't decrypt).
     Public posts don't need the login anyway, so a broken cookie source
     must not take down every Instagram/Threads download.
+
+    If the logged-out retry then fails too, that failure may well be
+    *because* the login was missing (private/restricted posts), so the
+    error is annotated with what happened to the cookies.
     """
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -186,11 +190,20 @@ def run_with_cookie_fallback(ydl_opts, action):
         if ('cookiesfrombrowser' not in ydl_opts
                 or 'cookie' not in str(e).lower()):
             raise
+        browser = ydl_opts['cookiesfrombrowser'][0]
         logger.warning("Browser cookies unavailable (%s); retrying without "
                        "cookies", e)
         opts = {k: v for k, v in ydl_opts.items() if k != 'cookiesfrombrowser'}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return action(ydl)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return action(ydl)
+        except Exception as retry_error:
+            raise Exception(
+                f"{retry_error}\n\nNote: your {browser} login was NOT used - "
+                f"its cookies could not be read (usually because {browser} is "
+                f"running and locking them). If this content needs your "
+                f"login, close {browser} completely and try again."
+            ) from retry_error
 
 
 class FormatSelector(tk.Toplevel):
