@@ -106,24 +106,38 @@ class ThreadsIE(InfoExtractor):
         lsd = self._search_regex(
             r'"LSD",\[\],\{"token":"([^"]+)"', webpage, 'lsd token')
 
+        # When browser cookies carry a Threads login, the API demands the
+        # authenticated request form: the fb_dtsg CSRF token plus the
+        # account id in av/__user. Sending the anonymous form (av=0) with
+        # session cookies fails with "Sorry, something went wrong".
+        fb_dtsg = self._search_regex(
+            r'"DTSGInitialData",\[\],\{"token":"([^"]+)"',
+            webpage, 'fb_dtsg token', default=None)
+        user_id = self._search_regex(
+            r'"(?:ACCOUNT_ID|USER_ID|IG_USER_EIMU)":\s*"(\d{3,})"',
+            webpage, 'account id', default=None)
+        post_data = {
+            'av': user_id or '0',
+            '__user': user_id or '0',
+            '__a': '1',
+            '__req': '1',
+            'dpr': '1',
+            'lsd': lsd,
+            'fb_api_caller_class': 'RelayModern',
+            'fb_api_req_friendly_name': 'BarcelonaPostPageContentQuery',
+            'variables': json.dumps({'postID': pk}),
+            'server_timestamps': 'true',
+            'doc_id': self._GRAPHQL_DOC_ID,
+        }
+        if fb_dtsg:
+            post_data['fb_dtsg'] = fb_dtsg
+
         response = self._download_json(
             'https://www.threads.com/api/graphql', video_id,
             note='Downloading post JSON',
             # Error responses carry an anti-JSON-hijacking prefix
             transform_source=lambda s: s.removeprefix('for (;;);'),
-            data=urlencode_postdata({
-                'av': '0',
-                '__user': '0',
-                '__a': '1',
-                '__req': '1',
-                'dpr': '1',
-                'lsd': lsd,
-                'fb_api_caller_class': 'RelayModern',
-                'fb_api_req_friendly_name': 'BarcelonaPostPageContentQuery',
-                'variables': json.dumps({'postID': pk}),
-                'server_timestamps': 'true',
-                'doc_id': self._GRAPHQL_DOC_ID,
-            }),
+            data=urlencode_postdata(post_data),
             headers={
                 'User-Agent': self._UA,
                 'Content-Type': 'application/x-www-form-urlencoded',
