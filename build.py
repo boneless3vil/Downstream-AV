@@ -1,6 +1,5 @@
 import PyInstaller.__main__
 import os
-import json
 import sys
 import shutil
 from pathlib import Path
@@ -14,15 +13,6 @@ def check_windows_environment():
         print("1. Python 3.11 or higher")
         print("2. Visual Studio Build Tools with C++ components")
         sys.exit(1)
-
-def create_default_settings():
-    """Create default settings file if it doesn't exist"""
-    default_settings = {
-        "download_path": os.path.expanduser("~/Downloads"),
-        "format": "mp4"
-    }
-    with open("settings.json", "w") as f:
-        json.dump(default_settings, f)
 
 def build_executable():
     """Build the Windows executable with proper configuration"""
@@ -42,11 +32,6 @@ def build_executable():
         print("Error: downstream.py not found in current directory")
         print("Please run this script from the repository root")
         sys.exit(1)
-
-    # Create default settings if it doesn't exist
-    if not os.path.exists("settings.json"):
-        print("Creating default settings.json...")
-        create_default_settings()
 
     # Create Windows-specific runtime hook
     print("Creating Windows runtime hook...")
@@ -95,7 +80,8 @@ if os.name == 'nt':  # Windows-specific initialization
         '--onefile',
         '--name=Downstream',
         '--windowed',  # Windows GUI mode
-        '--add-data=settings.json;.',  # Windows path separator
+        # Settings are NOT bundled: the app reads/writes them in
+        # %APPDATA%\Downstream (get_config_dir) so they survive updates
         # yt-dlp plugin package with the Threads extractor; unpacked into
         # sys._MEIPASS (which is on sys.path) so yt-dlp discovers it
         '--add-data=yt_dlp_plugins;yt_dlp_plugins',

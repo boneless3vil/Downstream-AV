@@ -116,7 +116,15 @@ def step_js_runtime():
 
 def step_settings():
     default_path = os.path.join(os.path.expanduser("~"), "Downloads")
-    settings_path = os.path.join(SCRIPT_DIR, "settings.json")
+    # Same per-user location the app uses (get_config_dir in downstream.py):
+    # survives updates and rebuilds
+    if IS_WINDOWS:
+        config_base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    else:
+        config_base = os.path.join(os.path.expanduser("~"), ".config")
+    config_dir = os.path.join(config_base, "Downstream")
+    os.makedirs(config_dir, exist_ok=True)
+    settings_path = os.path.join(config_dir, "settings.json")
     current = {}
     if os.path.exists(settings_path):
         try:

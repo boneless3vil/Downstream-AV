@@ -5,6 +5,7 @@ import yt_dlp
 import os
 import json
 import re
+import shutil
 import threading
 import sys
 import logging
@@ -21,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 APP_NAME = "Downstream"
-APP_VERSION = "1.6.7"
+APP_VERSION = "1.6.8"
 
 def get_base_path():
     """Get base path for resources, works both in development and when packaged"""
@@ -105,14 +106,48 @@ QUALITY_FORMATS = {
 }
 
 
+def get_config_dir():
+    """Per-user config/data folder: %APPDATA%\\Downstream on Windows.
+
+    Settings and download history live here - NOT next to the exe - so
+    they survive updates, rebuilds (which wipe dist\\), and moving or
+    duplicating the exe.
+    """
+    if os.name == 'nt':
+        base = os.environ.get('APPDATA') or os.path.expanduser('~')
+    else:
+        base = os.path.join(os.path.expanduser('~'), '.config')
+    path = os.path.join(base, APP_NAME)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _migrate_legacy_file(base_path, filename):
+    """One-time move of a data file from the old location (next to the
+    exe/script) into the config dir, preserving existing settings from
+    installs that predate get_config_dir()."""
+    new_path = os.path.join(get_config_dir(), filename)
+    if not os.path.exists(new_path):
+        legacy = os.path.join(base_path, filename)
+        if os.path.exists(legacy):
+            try:
+                shutil.copy(legacy, new_path)
+                logger.info("Migrated %s to %s", filename, new_path)
+            except OSError:
+                logger.warning("Could not migrate %s", legacy, exc_info=True)
+    return new_path
+
+
 def load_settings(base_path):
     """Read settings.json, falling back to defaults for missing/invalid values.
 
     Shared by the GUI and the extension API so both honor the same folders.
+    base_path is only used to migrate a settings file saved by older
+    versions next to the exe.
     """
     settings = dict(DEFAULT_SETTINGS)
     try:
-        settings_path = os.path.join(base_path, "settings.json")
+        settings_path = _migrate_legacy_file(base_path, "settings.json")
         if os.path.exists(settings_path):
             with open(settings_path, "r") as f:
                 settings.update(json.load(f))
@@ -1002,7 +1037,7 @@ class DownstreamApp:
         self.status_var.set("Settings saved")
 
     def save_settings_file(self):
-        settings_path = os.path.join(self.base_path, "settings.json")
+        settings_path = os.path.join(get_config_dir(), "settings.json")
         with open(settings_path, "w") as f:
             json.dump(self.settings, f)
 
@@ -1123,7 +1158,7 @@ class DownstreamApp:
 
     def log_download(self, url, download_type, status):
         try:
-            log_path = os.path.join(self.base_path, "download_history.log")
+            log_path = _migrate_legacy_file(self.base_path, "download_history.log")
             with self._history_lock, open(log_path, "a") as f:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 f.write(f"{timestamp} | {download_type} | {url} | {status}\n")
@@ -1144,7 +1179,8 @@ class DownstreamApp:
         text_widget.configure(yscrollcommand=scrollbar.set)
 
         try:
-            with open(os.path.join(self.base_path, "download_history.log"), "r") as f:
+            log_path = _migrate_legacy_file(self.base_path, "download_history.log")
+            with open(log_path, "r") as f:
                 history = f.read()
                 text_widget.insert(tk.END, history)
         except OSError:
