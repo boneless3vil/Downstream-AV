@@ -20,6 +20,9 @@ packaged exe it's bundled via build.py).
 
 import json
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 
 from yt_dlp.extractor.common import InfoExtractor
 from yt_dlp.utils import (
@@ -246,6 +249,47 @@ class ThreadsIE(InfoExtractor):
             'formats': formats,
             'thumbnails': thumbnails,
         }
+
+
+class ThreadsShareIE(InfoExtractor):
+    IE_NAME = 'threads:share'
+    IE_DESC = 'Threads share links (threads.com/share/CODE)'
+    _VALID_URL = r'https?://(?:www\.)?threads\.(?:net|com)/share/(?P<id>[^/?#&]+)'
+    _TESTS = [{
+        'url': 'https://www.threads.com/share/GR2RkcluE/',
+        'only_matching': True,
+    }]
+
+    def _real_extract(self, url):
+        share_id = self._match_id(url)
+        # With a full browser User-Agent Meta serves a JS shell that
+        # resolves the share code client-side; with a plain client UA the
+        # server answers 302 straight to the canonical post URL. The
+        # redirect must NOT be followed - fetching the target with a
+        # non-browser UA bounces to /?error=invalid_post - and yt-dlp's
+        # networking always follows redirects, so this one request goes
+        # through urllib directly (proxy settings are not applied to it).
+        self.to_screen(f'{share_id}: Resolving share link')
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):
+                return None
+
+        req = urllib.request.Request(url, headers={'User-Agent': 'curl/8.0'})
+        location = None
+        try:
+            urllib.request.build_opener(NoRedirect).open(req, timeout=20)
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                location = e.headers.get('Location')
+            else:
+                raise ExtractorError(
+                    f'Threads share link returned HTTP {e.code}', expected=True)
+        if not location or '/share/' in location or 'error=' in location:
+            raise ExtractorError(
+                'Could not resolve Threads share link - the post may have '
+                'been deleted', expected=True)
+        return self.url_result(urllib.parse.urljoin(url, location), ThreadsIE)
 
 
 class ThreadsIOSIE(InfoExtractor):

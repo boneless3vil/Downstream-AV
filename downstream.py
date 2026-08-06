@@ -21,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 APP_NAME = "Downstream"
-APP_VERSION = "1.6.6"
+APP_VERSION = "1.6.7"
 
 def get_base_path():
     """Get base path for resources, works both in development and when packaged"""
@@ -175,9 +175,11 @@ def run_with_cookie_fallback(ydl_opts, action):
     """Run action(ydl); if loading browser cookies fails, retry without them.
 
     Reading a browser's cookie DB fails routinely (the browser is running
-    and locks the file, or uses cookie encryption yt-dlp can't decrypt).
-    Public posts don't need the login anyway, so a broken cookie source
-    must not take down every Instagram/Threads download.
+    and locks the file, or uses cookie encryption yt-dlp can't decrypt -
+    e.g. Chrome/Edge app-bound encryption fails with "Failed to decrypt
+    with DPAPI", yt-dlp issue 10927). Public posts don't need the login
+    anyway, so a broken cookie source must not take down every
+    Instagram/Threads download.
 
     If the logged-out retry then fails too, that failure may well be
     *because* the login was missing (private/restricted posts), so the
@@ -187,8 +189,9 @@ def run_with_cookie_fallback(ydl_opts, action):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return action(ydl)
     except Exception as e:
+        err = str(e).lower()
         if ('cookiesfrombrowser' not in ydl_opts
-                or 'cookie' not in str(e).lower()):
+                or not any(s in err for s in ('cookie', 'dpapi', 'decrypt'))):
             raise
         browser = ydl_opts['cookiesfrombrowser'][0]
         logger.warning("Browser cookies unavailable (%s); retrying without "
@@ -523,7 +526,9 @@ class DownstreamApp:
         # leading /username/ path segment (share links include one)
         r'|instagram\.com/(?:[\w.]+/)?(?:reels?|p|tv)/[\w-]+'
         # threads.net|.com/@username/post/CODE
-        r'|threads\.(?:net|com)/@?[\w.]+/post/[\w-]+)',
+        r'|threads\.(?:net|com)/@?[\w.]+/post/[\w-]+'
+        # threads.net|.com/share/CODE (resolved by the Threads plugin)
+        r'|threads\.(?:net|com)/share/[\w-]+)',
         re.IGNORECASE
     )
 

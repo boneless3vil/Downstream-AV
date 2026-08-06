@@ -153,7 +153,8 @@ const VIDEO_PAGE_RE = new RegExp(
   'youtube\\.com/(watch|shorts/)' +
   '|youtu\\.be/' +
   '|instagram\\.com/([\\w.]+/)?(reels?|p|tv)/' +
-  '|threads\\.(net|com)/@?[\\w.]+/post/', 'i');
+  '|threads\\.(net|com)/@?[\\w.]+/post/' +
+  '|threads\\.(net|com)/share/', 'i');
 
 async function startDownload(url, tabId) {
   if (!url || !VIDEO_PAGE_RE.test(url)) {
