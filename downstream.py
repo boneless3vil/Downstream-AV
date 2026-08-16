@@ -22,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 APP_NAME = "Downstream"
-APP_VERSION = "1.6.8"
+APP_VERSION = "1.6.9"
 
 def get_base_path():
     """Get base path for resources, works both in development and when packaged"""
@@ -76,6 +76,10 @@ DEFAULT_SETTINGS = {
     # configured quality when a URL is entered/pasted
     "auto_download": False,
     "auto_download_quality": "best",
+    # Threads cross-posts (the video really lives on e.g. Instagram): ask
+    # before switching to the source site, or just go ahead and download
+    # from there
+    "confirm_crosspost": False,
 }
 
 # Quality presets for auto download and the extension API: a yt-dlp format
@@ -160,6 +164,7 @@ def load_settings(base_path):
         settings["auto_download"] = bool(settings.get("auto_download"))
         if settings.get("auto_download_quality") not in ("best", "medium", "low"):
             settings["auto_download_quality"] = DEFAULT_SETTINGS["auto_download_quality"]
+        settings["confirm_crosspost"] = bool(settings.get("confirm_crosspost"))
     except Exception:
         return dict(DEFAULT_SETTINGS)
     return settings
@@ -846,11 +851,12 @@ class DownstreamApp:
 
     def show_crosspost_warning(self, source, source_url):
         """The Threads post has no video of its own - it's cross-posted from
-        another site. Say where the video actually lives and, when the app
-        supports that site, offer to download from there right away."""
+        another site. When the app supports that site, download from there
+        instead (asking first only if the "confirm cross-posts" setting is
+        on); otherwise say where the video actually lives."""
         self.status_var.set(f"Cross-post - video is on {source}")
         if SUPPORTED_URL_RE.search(source_url):
-            if messagebox.askyesno(
+            if not self.settings.get("confirm_crosspost") or messagebox.askyesno(
                     "Cross-posted video",
                     "This Threads post is a cross-post - the video is "
                     f"actually hosted on {source}:\n\n{source_url}\n\n"
@@ -1013,7 +1019,8 @@ class DownstreamApp:
         return load_settings(self.base_path)
 
     def save_settings(self, source_var, dest_var, type_var, format_var,
-                      cookies_var, auto_var, quality_var, settings_window):
+                      cookies_var, auto_var, quality_var, crosspost_var,
+                      settings_window):
         source = source_var.get().strip()
         dest = dest_var.get().strip()
         if not os.path.isdir(dest):
@@ -1030,6 +1037,7 @@ class DownstreamApp:
         self.settings["cookies_browser"] = cookies_var.get().strip()
         self.settings["auto_download"] = bool(auto_var.get())
         self.settings["auto_download_quality"] = quality_var.get()
+        self.settings["confirm_crosspost"] = bool(crosspost_var.get())
         self.save_settings_file()
         # Apply the new default to the main window immediately
         self.download_type.set(type_var.get())
@@ -1052,7 +1060,7 @@ class DownstreamApp:
     def show_settings(self):
         settings_window = tk.Toplevel(self.root)
         settings_window.title("Settings")
-        settings_window.geometry("520x300")
+        settings_window.geometry("520x330")
         settings_window.resizable(False, False)
 
         settings_frame = ttk.Frame(settings_window, padding="10")
@@ -1126,12 +1134,24 @@ class DownstreamApp:
         quality_box.pack(side=tk.LEFT, padx=5)
         sync_quality_state()
 
+        # Threads cross-posts: the video is really on another site (e.g. an
+        # Instagram reel). Off = download from the source site right away;
+        # on = ask first.
+        crosspost_frame = ttk.Frame(settings_frame)
+        crosspost_frame.pack(fill=tk.X, pady=3)
+        ttk.Label(crosspost_frame, text="Threads cross-posts:", width=22).pack(side=tk.LEFT)
+        crosspost_var = tk.BooleanVar(value=bool(self.settings.get("confirm_crosspost")))
+        ttk.Checkbutton(crosspost_frame,
+                        text="ask before downloading from the source site",
+                        variable=crosspost_var).pack(side=tk.LEFT, padx=5)
+
         save_frame = ttk.Frame(settings_frame)
         save_frame.pack(fill=tk.X, pady=10)
         ttk.Button(save_frame, text="Save",
                    command=lambda: self.save_settings(source_var, dest_var, type_var,
                                                       format_var, cookies_var,
                                                       auto_var, quality_var,
+                                                      crosspost_var,
                                                       settings_window)).pack()
 
     def open_download_folder(self):

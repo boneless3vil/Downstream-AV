@@ -115,6 +115,10 @@ Then install ffmpeg (and ideally Deno) with your system's package manager.
      the download immediately at a preset quality (best / medium ≈720p /
      low ≈480p; for audio-only downloads ≈128 / ≈64 kbps). Quality caps use
      the shorter video side, so vertical reels/Shorts pick sensibly.
+   - Threads cross-posts: when a Threads post's video actually lives on
+     another supported site (e.g. an Instagram reel shared to Threads) the
+     app downloads it from there. Tick "ask before downloading from the
+     source site" to get a confirmation dialog first (off by default).
 
 5. History (title-bar icon menu, "Download History..."):
    - View past downloads with timestamp, format, and status
