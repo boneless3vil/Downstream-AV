@@ -1060,7 +1060,6 @@ class DownstreamApp:
     def show_settings(self):
         settings_window = tk.Toplevel(self.root)
         settings_window.title("Settings")
-        settings_window.geometry("520x330")
         settings_window.resizable(False, False)
 
         settings_frame = ttk.Frame(settings_window, padding="10")
@@ -1153,6 +1152,13 @@ class DownstreamApp:
                                                       auto_var, quality_var,
                                                       crosspost_var,
                                                       settings_window)).pack()
+
+        # Size the window to its content rather than a fixed pixel geometry,
+        # which clipped the right-hand labels and the Save button at display
+        # scalings other than 100%. minsize keeps the folder entries roomy.
+        settings_window.update_idletasks()
+        settings_window.minsize(max(560, settings_window.winfo_reqwidth()),
+                                settings_window.winfo_reqheight())
 
     def open_download_folder(self):
         """Show the destination folder in the file manager."""
