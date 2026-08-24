@@ -22,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 APP_NAME = "Downstream"
-APP_VERSION = "1.6.9"
+APP_VERSION = "1.6.10"
 
 def get_base_path():
     """Get base path for resources, works both in development and when packaged"""
