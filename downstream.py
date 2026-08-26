@@ -22,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 APP_NAME = "Downstream"
-APP_VERSION = "1.6.10"
+APP_VERSION = "1.6.11"
 
 def get_base_path():
     """Get base path for resources, works both in development and when packaged"""
@@ -230,8 +230,15 @@ def run_with_cookie_fallback(ydl_opts, action):
             return action(ydl)
     except Exception as e:
         err = str(e).lower()
+        # Only genuine cookie-*loading* failures qualify. yt-dlp wraps them
+        # in a DownloadError whose text names the cookie database / the
+        # decryption step; extractor errors that merely *mention* cookies
+        # ("...configure that browser for cookies") must not match, or a
+        # perfectly good login gets blamed for an unrelated failure.
         if ('cookiesfrombrowser' not in ydl_opts
-                or not any(s in err for s in ('cookie', 'dpapi', 'decrypt'))):
+                or not any(s in err for s in (
+                    'failed to load cookies', 'cookies database',
+                    'cookie database', 'dpapi', 'decrypt', 'keyring'))):
             raise
         browser = ydl_opts['cookiesfrombrowser'][0]
         logger.warning("Browser cookies unavailable (%s); retrying without "
