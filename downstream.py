@@ -22,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 APP_NAME = "Downstream"
-APP_VERSION = "1.6.11"
+APP_VERSION = "1.6.12"
 
 def get_base_path():
     """Get base path for resources, works both in development and when packaged"""
@@ -186,7 +186,8 @@ BASE_YDL_OPTS = {"remote_components": ["ejs:github"]}
 # Sites the app accepts. yt-dlp can handle many more, but the GUI's format
 # filtering and options are only tuned for these.
 SUPPORTED_URL_RE = re.compile(
-    r'(youtube\.com|youtu\.be|instagram\.com|threads\.(?:net|com))',
+    r'(youtube\.com|youtu\.be|instagram\.com|threads\.(?:net|com)'
+    r'|tiktok\.com)',  # also covers the vm./vt. short-link hosts
     re.IGNORECASE)
 
 META_URL_RE = re.compile(r'(instagram\.com|threads\.(?:net|com))', re.IGNORECASE)
@@ -575,7 +576,12 @@ class DownstreamApp:
         # threads.net|.com/@username/post/CODE
         r'|threads\.(?:net|com)/@?[\w.]+/post/[\w-]+'
         # threads.net|.com/share/CODE (resolved by the Threads plugin)
-        r'|threads\.(?:net|com)/share/[\w-]+)',
+        r'|threads\.(?:net|com)/share/[\w-]+'
+        # tiktok.com/@username/video/ID (the @username may be empty)
+        r'|tiktok\.com/@[\w.-]*/video/\d+'
+        # short links: vm.tiktok.com/CODE, vt.tiktok.com/CODE, tiktok.com/t/CODE
+        r'|(?:vm|vt)\.tiktok\.com/[\w-]+'
+        r'|tiktok\.com/t/[\w-]+)',
         re.IGNORECASE
     )
 
@@ -743,7 +749,7 @@ class DownstreamApp:
         if not SUPPORTED_URL_RE.search(url):
             messagebox.showerror(
                 "Error",
-                "Unsupported URL.\n\nSupported sites: YouTube, Instagram, Threads")
+                "Unsupported URL.\n\nSupported sites: YouTube, Instagram, Threads, TikTok")
             return
 
         # Remember what we fetched so the auto-fetch trace doesn't fire a

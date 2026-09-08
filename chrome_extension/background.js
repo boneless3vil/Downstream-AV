@@ -170,12 +170,15 @@ const VIDEO_PAGE_RE = new RegExp(
   '|youtu\\.be/' +
   '|instagram\\.com/([\\w.]+/)?(reels?|p|tv)/' +
   '|threads\\.(net|com)/@?[\\w.]+/post/' +
-  '|threads\\.(net|com)/share/', 'i');
+  '|threads\\.(net|com)/share/' +
+  '|tiktok\\.com/@[\\w.-]*/video/' +
+  '|(vm|vt)\\.tiktok\\.com/' +
+  '|tiktok\\.com/t/', 'i');
 
 async function startDownload(url, tabId) {
   if (!url || !VIDEO_PAGE_RE.test(url)) {
     flashBadge('!', '#f0ad4e',
-      'Open a YouTube, Instagram, or Threads video page first');
+      'Open a YouTube, Instagram, Threads, or TikTok video page first');
     return { success: false, error: 'Not a supported video page' };
   }
   try {

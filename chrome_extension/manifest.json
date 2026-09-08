@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Downstream",
-  "version": "1.4",
-  "description": "Send YouTube, Instagram, and Threads videos to Downstream with one click",
+  "version": "1.5",
+  "description": "Send YouTube, Instagram, Threads, and TikTok videos to Downstream with one click",
   "permissions": [
     "contextMenus",
     "activeTab",
