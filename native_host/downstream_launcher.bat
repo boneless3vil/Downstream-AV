@@ -1,8 +1,7 @@
 @echo off
-rem Native messaging host for the Downstream browser extension.
-rem The browser runs this when the extension finds the desktop app's API
-rem down; it starts the app (if needed) and exits without speaking the
-rem native-messaging protocol - the extension polls the API instead of
-rem reading a reply.
-tasklist /FI "IMAGENAME eq Downstream.exe" 2>nul | find /I "Downstream.exe" >nul
-if errorlevel 1 start "" "C:\bin\Downstream\Downstream.exe"
+rem Native messaging host for the Downstream browser extension (registered
+rem by register_host.ps1). Browsers can only launch an .exe or .bat as a host,
+rem so this shim just hands off to downstream_launcher.ps1, which starts the
+rem app without leaking the browser's stdio pipes into it and replies over the
+rem native-messaging protocol. Full paths so a stray PATH entry can't shadow them.
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0downstream_launcher.ps1"

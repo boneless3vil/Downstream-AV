@@ -5,6 +5,7 @@ import yt_dlp
 import os
 import json
 import re
+import shutil
 import threading
 import sys
 import logging
@@ -21,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 APP_NAME = "Downstream"
-APP_VERSION = "1.6.4"
+APP_VERSION = "1.6.12"
 
 def get_base_path():
     """Get base path for resources, works both in development and when packaged"""
@@ -75,6 +76,10 @@ DEFAULT_SETTINGS = {
     # configured quality when a URL is entered/pasted
     "auto_download": False,
     "auto_download_quality": "best",
+    # Threads cross-posts (the video really lives on e.g. Instagram): ask
+    # before switching to the source site, or just go ahead and download
+    # from there
+    "confirm_crosspost": False,
 }
 
 # Quality presets for auto download and the extension API: a yt-dlp format
@@ -105,14 +110,48 @@ QUALITY_FORMATS = {
 }
 
 
+def get_config_dir():
+    """Per-user config/data folder: %APPDATA%\\Downstream on Windows.
+
+    Settings and download history live here - NOT next to the exe - so
+    they survive updates, rebuilds (which wipe dist\\), and moving or
+    duplicating the exe.
+    """
+    if os.name == 'nt':
+        base = os.environ.get('APPDATA') or os.path.expanduser('~')
+    else:
+        base = os.path.join(os.path.expanduser('~'), '.config')
+    path = os.path.join(base, APP_NAME)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _migrate_legacy_file(base_path, filename):
+    """One-time move of a data file from the old location (next to the
+    exe/script) into the config dir, preserving existing settings from
+    installs that predate get_config_dir()."""
+    new_path = os.path.join(get_config_dir(), filename)
+    if not os.path.exists(new_path):
+        legacy = os.path.join(base_path, filename)
+        if os.path.exists(legacy):
+            try:
+                shutil.copy(legacy, new_path)
+                logger.info("Migrated %s to %s", filename, new_path)
+            except OSError:
+                logger.warning("Could not migrate %s", legacy, exc_info=True)
+    return new_path
+
+
 def load_settings(base_path):
     """Read settings.json, falling back to defaults for missing/invalid values.
 
     Shared by the GUI and the extension API so both honor the same folders.
+    base_path is only used to migrate a settings file saved by older
+    versions next to the exe.
     """
     settings = dict(DEFAULT_SETTINGS)
     try:
-        settings_path = os.path.join(base_path, "settings.json")
+        settings_path = _migrate_legacy_file(base_path, "settings.json")
         if os.path.exists(settings_path):
             with open(settings_path, "r") as f:
                 settings.update(json.load(f))
@@ -125,6 +164,7 @@ def load_settings(base_path):
         settings["auto_download"] = bool(settings.get("auto_download"))
         if settings.get("auto_download_quality") not in ("best", "medium", "low"):
             settings["auto_download_quality"] = DEFAULT_SETTINGS["auto_download_quality"]
+        settings["confirm_crosspost"] = bool(settings.get("confirm_crosspost"))
     except Exception:
         return dict(DEFAULT_SETTINGS)
     return settings
@@ -146,7 +186,8 @@ BASE_YDL_OPTS = {"remote_components": ["ejs:github"]}
 # Sites the app accepts. yt-dlp can handle many more, but the GUI's format
 # filtering and options are only tuned for these.
 SUPPORTED_URL_RE = re.compile(
-    r'(youtube\.com|youtu\.be|instagram\.com|threads\.(?:net|com))',
+    r'(youtube\.com|youtu\.be|instagram\.com|threads\.(?:net|com)'
+    r'|tiktok\.com)',  # also covers the vm./vt. short-link hosts
     re.IGNORECASE)
 
 META_URL_RE = re.compile(r'(instagram\.com|threads\.(?:net|com))', re.IGNORECASE)
@@ -175,22 +216,45 @@ def run_with_cookie_fallback(ydl_opts, action):
     """Run action(ydl); if loading browser cookies fails, retry without them.
 
     Reading a browser's cookie DB fails routinely (the browser is running
-    and locks the file, or uses cookie encryption yt-dlp can't decrypt).
-    Public posts don't need the login anyway, so a broken cookie source
-    must not take down every Instagram/Threads download.
+    and locks the file, or uses cookie encryption yt-dlp can't decrypt -
+    e.g. Chrome/Edge app-bound encryption fails with "Failed to decrypt
+    with DPAPI", yt-dlp issue 10927). Public posts don't need the login
+    anyway, so a broken cookie source must not take down every
+    Instagram/Threads download.
+
+    If the logged-out retry then fails too, that failure may well be
+    *because* the login was missing (private/restricted posts), so the
+    error is annotated with what happened to the cookies.
     """
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return action(ydl)
     except Exception as e:
+        err = str(e).lower()
+        # Only genuine cookie-*loading* failures qualify. yt-dlp wraps them
+        # in a DownloadError whose text names the cookie database / the
+        # decryption step; extractor errors that merely *mention* cookies
+        # ("...configure that browser for cookies") must not match, or a
+        # perfectly good login gets blamed for an unrelated failure.
         if ('cookiesfrombrowser' not in ydl_opts
-                or 'cookie' not in str(e).lower()):
+                or not any(s in err for s in (
+                    'failed to load cookies', 'cookies database',
+                    'cookie database', 'dpapi', 'decrypt', 'keyring'))):
             raise
+        browser = ydl_opts['cookiesfrombrowser'][0]
         logger.warning("Browser cookies unavailable (%s); retrying without "
                        "cookies", e)
         opts = {k: v for k, v in ydl_opts.items() if k != 'cookiesfrombrowser'}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return action(ydl)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return action(ydl)
+        except Exception as retry_error:
+            raise Exception(
+                f"{retry_error}\n\nNote: your {browser} login was NOT used - "
+                f"its cookies could not be read (usually because {browser} is "
+                f"running and locking them). If this content needs your "
+                f"login, close {browser} completely and try again."
+            ) from retry_error
 
 
 class FormatSelector(tk.Toplevel):
@@ -350,6 +414,9 @@ class DownstreamApp:
             # Settings lives in the window's native title-bar menu (the icon
             # at the top left); deferred until the window exists on screen
             self.root.after(200, self.add_settings_to_system_menu)
+            # A port bind failure surfaces within Flask's first moments;
+            # checking a few seconds in is late enough to catch it
+            self.root.after(3000, self._warn_if_port_conflict)
             logger.debug("GUI setup completed successfully")
         except Exception as e:
             logger.error(f"Error in setup_gui: {str(e)}", exc_info=True)
@@ -373,6 +440,7 @@ class DownstreamApp:
     # App-defined WM_SYSCOMMAND ids must be < 0xF000
     SYSMENU_SETTINGS_ID = 0x1000
     SYSMENU_HISTORY_ID = 0x1010
+    SYSMENU_OPENFOLDER_ID = 0x1020
 
     def add_settings_to_system_menu(self):
         """Append Settings... and Download History... to the native
@@ -412,6 +480,8 @@ class DownstreamApp:
             self._sysmenu_actions = {
                 self.SYSMENU_SETTINGS_ID: ("Settings...", self.show_settings),
                 self.SYSMENU_HISTORY_ID: ("Download History...", self.show_history),
+                self.SYSMENU_OPENFOLDER_ID: ("Open Download Folder",
+                                             self.open_download_folder),
             }
             sysmenu = user32.GetSystemMenu(hwnd, False)
             user32.AppendMenuW(sysmenu, MF_SEPARATOR, 0, None)
@@ -464,6 +534,8 @@ class DownstreamApp:
         app_menu = tk.Menu(menubar, tearoff=0)
         app_menu.add_command(label="Settings...", command=self.show_settings)
         app_menu.add_command(label="Download History...", command=self.show_history)
+        app_menu.add_command(label="Open Download Folder",
+                             command=self.open_download_folder)
         menubar.add_cascade(label="Menu", menu=app_menu)
         self.root.config(menu=menubar)
 
@@ -502,7 +574,14 @@ class DownstreamApp:
         # leading /username/ path segment (share links include one)
         r'|instagram\.com/(?:[\w.]+/)?(?:reels?|p|tv)/[\w-]+'
         # threads.net|.com/@username/post/CODE
-        r'|threads\.(?:net|com)/@?[\w.]+/post/[\w-]+)',
+        r'|threads\.(?:net|com)/@?[\w.]+/post/[\w-]+'
+        # threads.net|.com/share/CODE (resolved by the Threads plugin)
+        r'|threads\.(?:net|com)/share/[\w-]+'
+        # tiktok.com/@username/video/ID (the @username may be empty)
+        r'|tiktok\.com/@[\w.-]*/video/\d+'
+        # short links: vm.tiktok.com/CODE, vt.tiktok.com/CODE, tiktok.com/t/CODE
+        r'|(?:vm|vt)\.tiktok\.com/[\w-]+'
+        r'|tiktok\.com/t/[\w-]+)',
         re.IGNORECASE
     )
 
@@ -628,6 +707,16 @@ class DownstreamApp:
         self.status_label = ttk.Label(progress_frame, textvariable=self.status_var)
         self.status_label.pack(anchor=tk.W, pady=(2, 0))
 
+    def _warn_if_port_conflict(self):
+        """Tell the user when the extension API port couldn't be bound.
+
+        Only overwrite an idle status bar - never an in-flight download's.
+        """
+        if api_port_conflict.is_set() and self.status_var.get() == "Ready":
+            self.status_var.set(
+                "Extension port busy - is another copy of Downstream running?")
+            self.flash_status()
+
     def flash_status(self, flashes=3, interval=250):
         """Flash the status label red the given number of times, then
         restore the theme's default text color."""
@@ -660,7 +749,7 @@ class DownstreamApp:
         if not SUPPORTED_URL_RE.search(url):
             messagebox.showerror(
                 "Error",
-                "Unsupported URL.\n\nSupported sites: YouTube, Instagram, Threads")
+                "Unsupported URL.\n\nSupported sites: YouTube, Instagram, Threads, TikTok")
             return
 
         # Remember what we fetched so the auto-fetch trace doesn't fire a
@@ -775,11 +864,12 @@ class DownstreamApp:
 
     def show_crosspost_warning(self, source, source_url):
         """The Threads post has no video of its own - it's cross-posted from
-        another site. Say where the video actually lives and, when the app
-        supports that site, offer to download from there right away."""
+        another site. When the app supports that site, download from there
+        instead (asking first only if the "confirm cross-posts" setting is
+        on); otherwise say where the video actually lives."""
         self.status_var.set(f"Cross-post - video is on {source}")
         if SUPPORTED_URL_RE.search(source_url):
-            if messagebox.askyesno(
+            if not self.settings.get("confirm_crosspost") or messagebox.askyesno(
                     "Cross-posted video",
                     "This Threads post is a cross-post - the video is "
                     f"actually hosted on {source}:\n\n{source_url}\n\n"
@@ -935,14 +1025,15 @@ class DownstreamApp:
                 if total > 0:
                     progress = (downloaded / total) * 100
                     self.root.after(0, self.progress_var.set, progress)
-            except:
+            except Exception:
                 pass
 
     def load_settings(self):
         return load_settings(self.base_path)
 
     def save_settings(self, source_var, dest_var, type_var, format_var,
-                      cookies_var, auto_var, quality_var, settings_window):
+                      cookies_var, auto_var, quality_var, crosspost_var,
+                      settings_window):
         source = source_var.get().strip()
         dest = dest_var.get().strip()
         if not os.path.isdir(dest):
@@ -959,6 +1050,7 @@ class DownstreamApp:
         self.settings["cookies_browser"] = cookies_var.get().strip()
         self.settings["auto_download"] = bool(auto_var.get())
         self.settings["auto_download_quality"] = quality_var.get()
+        self.settings["confirm_crosspost"] = bool(crosspost_var.get())
         self.save_settings_file()
         # Apply the new default to the main window immediately
         self.download_type.set(type_var.get())
@@ -966,7 +1058,7 @@ class DownstreamApp:
         self.status_var.set("Settings saved")
 
     def save_settings_file(self):
-        settings_path = os.path.join(self.base_path, "settings.json")
+        settings_path = os.path.join(get_config_dir(), "settings.json")
         with open(settings_path, "w") as f:
             json.dump(self.settings, f)
 
@@ -975,13 +1067,12 @@ class DownstreamApp:
             clipboard_content = pyperclip.paste()
             if SUPPORTED_URL_RE.search(clipboard_content or ""):
                 self.url_var.set(clipboard_content)
-        except:
+        except Exception:
             pass
 
     def show_settings(self):
         settings_window = tk.Toplevel(self.root)
         settings_window.title("Settings")
-        settings_window.geometry("520x300")
         settings_window.resizable(False, False)
 
         settings_frame = ttk.Frame(settings_window, padding="10")
@@ -1055,13 +1146,44 @@ class DownstreamApp:
         quality_box.pack(side=tk.LEFT, padx=5)
         sync_quality_state()
 
+        # Threads cross-posts: the video is really on another site (e.g. an
+        # Instagram reel). Off = download from the source site right away;
+        # on = ask first.
+        crosspost_frame = ttk.Frame(settings_frame)
+        crosspost_frame.pack(fill=tk.X, pady=3)
+        ttk.Label(crosspost_frame, text="Threads cross-posts:", width=22).pack(side=tk.LEFT)
+        crosspost_var = tk.BooleanVar(value=bool(self.settings.get("confirm_crosspost")))
+        ttk.Checkbutton(crosspost_frame,
+                        text="ask before downloading from the source site",
+                        variable=crosspost_var).pack(side=tk.LEFT, padx=5)
+
         save_frame = ttk.Frame(settings_frame)
         save_frame.pack(fill=tk.X, pady=10)
         ttk.Button(save_frame, text="Save",
                    command=lambda: self.save_settings(source_var, dest_var, type_var,
                                                       format_var, cookies_var,
                                                       auto_var, quality_var,
+                                                      crosspost_var,
                                                       settings_window)).pack()
+
+        # Size the window to its content rather than a fixed pixel geometry,
+        # which clipped the right-hand labels and the Save button at display
+        # scalings other than 100%. minsize keeps the folder entries roomy.
+        settings_window.update_idletasks()
+        settings_window.minsize(max(560, settings_window.winfo_reqwidth()),
+                                settings_window.winfo_reqheight())
+
+    def open_download_folder(self):
+        """Show the destination folder in the file manager."""
+        path = self.settings["download_path"]
+        try:
+            if os.name == 'nt':
+                os.startfile(path)
+            else:
+                import subprocess
+                subprocess.Popen(['xdg-open', path])
+        except OSError:
+            messagebox.showerror("Error", f"Could not open folder:\n{path}")
 
     def browse_path(self, path_var):
         path = filedialog.askdirectory(
@@ -1069,13 +1191,17 @@ class DownstreamApp:
         if path:
             path_var.set(path)
 
+    # Several download threads can finish at once; serialize their appends
+    # so history lines can't interleave
+    _history_lock = threading.Lock()
+
     def log_download(self, url, download_type, status):
         try:
-            log_path = os.path.join(self.base_path, "download_history.log")
-            with open(log_path, "a") as f:
+            log_path = _migrate_legacy_file(self.base_path, "download_history.log")
+            with self._history_lock, open(log_path, "a") as f:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 f.write(f"{timestamp} | {download_type} | {url} | {status}\n")
-        except:
+        except Exception:
             pass
 
     def show_history(self):
@@ -1092,10 +1218,11 @@ class DownstreamApp:
         text_widget.configure(yscrollcommand=scrollbar.set)
 
         try:
-            with open(os.path.join(self.base_path, "download_history.log"), "r") as f:
+            log_path = _migrate_legacy_file(self.base_path, "download_history.log")
+            with open(log_path, "r") as f:
                 history = f.read()
                 text_widget.insert(tk.END, history)
-        except:
+        except OSError:
             text_widget.insert(tk.END, "No download history available.")
 
         text_widget.configure(state=tk.DISABLED)
@@ -1180,6 +1307,11 @@ def api_download():
 API_PORT = 47811
 
 
+# Set when the API port can't be bound so the GUI can tell the user why the
+# browser extension won't work this session
+api_port_conflict = threading.Event()
+
+
 def run_flask():
     # Bind to localhost only: the API is meant for the local Chrome extension,
     # exposing it on all interfaces would let anyone on the network trigger downloads
@@ -1187,6 +1319,7 @@ def run_flask():
         flask_app.run(host='127.0.0.1', port=API_PORT)
     except OSError:
         # Port taken: GUI downloads still work, only the extension is affected
+        api_port_conflict.set()
         logger.critical(
             f"Could not bind 127.0.0.1:{API_PORT} - is another copy of the "
             "app running? The Chrome extension will not work this session.",
@@ -1240,7 +1373,7 @@ def main():
             # Try to show error in GUI if possible, otherwise use console
             try:
                 messagebox.showerror("Fatal Error", error_msg)
-            except:
+            except Exception:
                 print("FATAL ERROR:", error_msg)
             sys.exit(1)
 
@@ -1253,10 +1386,10 @@ def main():
         logger.error(f"Application error: {str(e)}", exc_info=True)
         if not isinstance(e, SystemExit):
             try:
-                messagebox.showerror("Fatal Error", 
+                messagebox.showerror("Fatal Error",
                                    f"Application failed to start: {str(e)}\n\n"
                                    "Please check the logs for more details.")
-            except:
+            except Exception:
                 print("FATAL ERROR:", str(e))
         sys.exit(1)
 

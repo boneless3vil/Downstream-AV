@@ -59,6 +59,25 @@
 - To install the desktop app, run `python install.py` in the repository
   root — the installer can also open this extension setup for you.
 
+## Auto-starting the desktop app (optional)
+
+The extension can start Downstream itself when you click it and the app
+isn't running. This uses a browser "native messaging host" that has to be
+registered once per Windows user:
+
+1. Make sure `native_host\com.boneless3vil.downstream_launcher.json` lists
+   your extension's ID in `allowed_origins` (find the ID on
+   `chrome://extensions` / `edge://extensions`; for an unpacked extension it
+   is derived from the folder path, so it changes if the folder moves).
+2. Run `native_host\register_host.ps1` in PowerShell. It registers the host
+   for both Chrome and Edge under HKCU — no admin rights needed.
+3. Reload the extension.
+
+Now a click with the app closed shows a blue "…" badge while Downstream
+starts (the packaged exe takes a few seconds to unpack), then sends the
+download. If the badge turns red, hover over it: the tooltip says whether the
+host isn't registered or the app didn't start.
+
 ## Troubleshooting
 
 If the extension doesn't work:

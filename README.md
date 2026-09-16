@@ -10,6 +10,8 @@ A feature-rich video downloader with a graphical user interface that allows you 
 - **Threads** — video posts on threads.net / threads.com (via a bundled
   yt-dlp extractor plugin in `yt_dlp_plugins/`, since mainline yt-dlp does
   not support Threads)
+- **TikTok** — videos, including vm.tiktok.com / vt.tiktok.com /
+  tiktok.com/t short links (no login needed for public videos)
 
 ## Features
 
@@ -90,7 +92,7 @@ Then install ffmpeg (and ideally Deno) with your system's package manager.
 ```
 
 2. Basic Video Download:
-   - Enter a YouTube, Instagram, or Threads URL or paste from clipboard
+   - Enter a YouTube, Instagram, Threads, or TikTok URL or paste from clipboard
    - Select download type (Video+Audio, Video Only, Audio Only)
    - Click "Download" and select your preferred quality
    - Monitor progress in the status bar
@@ -115,6 +117,10 @@ Then install ffmpeg (and ideally Deno) with your system's package manager.
      the download immediately at a preset quality (best / medium ≈720p /
      low ≈480p; for audio-only downloads ≈128 / ≈64 kbps). Quality caps use
      the shorter video side, so vertical reels/Shorts pick sensibly.
+   - Threads cross-posts: when a Threads post's video actually lives on
+     another supported site (e.g. an Instagram reel shared to Threads) the
+     app downloads it from there. Tick "ask before downloading from the
+     source site" to get a confirmation dialog first (off by default).
 
 5. History (title-bar icon menu, "Download History..."):
    - View past downloads with timestamp, format, and status

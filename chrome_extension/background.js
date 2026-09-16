@@ -110,21 +110,37 @@ async function isAppRunning() {
 }
 
 // Ask the native host to start Downstream, then wait for its API to come up.
-// The launcher exits without replying, so sendNativeMessage always reports an
-// error - that's expected and ignored; polling the API is the real signal.
-// The wait is generous: the packaged exe unpacks itself before starting.
+// The host replies {launched, running, error} and exits; the API answering
+// is the real signal that the app is ready. Throws with a message fit for
+// the badge tooltip when the app can't be started.
 async function launchAppAndWait() {
   chrome.action.setBadgeBackgroundColor({ color: '#1565c0' });
   chrome.action.setBadgeText({ text: '…' });
   chrome.action.setTitle({ title: 'Starting Downstream...' });
+  let reply;
   try {
-    await chrome.runtime.sendNativeMessage(LAUNCHER_HOST, { action: 'launch' });
-  } catch { /* expected: the launcher never replies */ }
-  for (let i = 0; i < 45; i++) {
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    if (await isAppRunning()) return true;
+    reply = await chrome.runtime.sendNativeMessage(LAUNCHER_HOST, { action: 'launch' });
+  } catch (error) {
+    // Typically "Specified native messaging host not found": the host isn't
+    // registered for this browser/extension ID (run native_host\register_host.ps1)
+    throw new Error('Could not start Downstream: ' + error.message +
+      ' - run native_host\\register_host.ps1 or start the app manually');
   }
-  return false;
+  if (reply && reply.error) {
+    throw new Error('Could not start Downstream: ' + reply.error);
+  }
+  // Generous wait: the packaged exe unpacks itself before starting. Each
+  // pass touches an extension API (the badge) on purpose - Chrome ends an
+  // idle MV3 service worker after ~30s, and plain fetch()/setTimeout don't
+  // count as activity, so a long silent poll would get us killed mid-wait.
+  const dots = ['·', '··', '···'];
+  for (let i = 0; i < 60; i++) {
+    chrome.action.setBadgeText({ text: dots[i % dots.length] });
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    if (await isAppRunning()) return;
+  }
+  throw new Error('Downstream started but its API (port 47811) did not answer' +
+    ' - is another program using that port?');
 }
 
 async function postDownload(url) {
@@ -153,12 +169,16 @@ const VIDEO_PAGE_RE = new RegExp(
   'youtube\\.com/(watch|shorts/)' +
   '|youtu\\.be/' +
   '|instagram\\.com/([\\w.]+/)?(reels?|p|tv)/' +
-  '|threads\\.(net|com)/@?[\\w.]+/post/', 'i');
+  '|threads\\.(net|com)/@?[\\w.]+/post/' +
+  '|threads\\.(net|com)/share/' +
+  '|tiktok\\.com/@[\\w.-]*/video/' +
+  '|(vm|vt)\\.tiktok\\.com/' +
+  '|tiktok\\.com/t/', 'i');
 
 async function startDownload(url, tabId) {
   if (!url || !VIDEO_PAGE_RE.test(url)) {
     flashBadge('!', '#f0ad4e',
-      'Open a YouTube, Instagram, or Threads video page first');
+      'Open a YouTube, Instagram, Threads, or TikTok video page first');
     return { success: false, error: 'Not a supported video page' };
   }
   try {
@@ -171,9 +191,7 @@ async function startDownload(url, tabId) {
       if (!String(error.message).includes('Failed to fetch')) {
         throw error;
       }
-      if (!await launchAppAndWait()) {
-        throw new Error('Could not start Downstream - start it manually');
-      }
+      await launchAppAndWait();
       data = await postDownload(url);
     }
     flashBadge('✓', '#2e7d32', 'Download started');
