@@ -121,6 +121,13 @@ Then install ffmpeg (and ideally Deno) with your system's package manager.
      another supported site (e.g. an Instagram reel shared to Threads) the
      app downloads it from there. Tick "ask before downloading from the
      source site" to get a confirmation dialog first (off by default).
+   - Transcripts: save the platform's captions alongside the video as a
+     plain-text transcript (.txt), closed captions (.srt), or both. When
+     either is on, each download is placed in its own subfolder named
+     after the video. English and original-language auto captions are
+     used when the site provides them (YouTube nearly always, TikTok
+     sometimes, Instagram/Threads rarely); videos without captions still
+     download, just without a transcript.
 
 5. History (title-bar icon menu, "Download History..."):
    - View past downloads with timestamp, format, and status
