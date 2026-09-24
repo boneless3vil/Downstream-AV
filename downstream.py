@@ -2,6 +2,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, messagebox, filedialog
 import yt_dlp
+from yt_dlp.postprocessor.common import PostProcessor
 import os
 import json
 import re
@@ -22,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 APP_NAME = "Downstream"
-APP_VERSION = "1.6.12"
+APP_VERSION = "1.6.13"
 
 def get_base_path():
     """Get base path for resources, works both in development and when packaged"""
@@ -80,6 +81,11 @@ DEFAULT_SETTINGS = {
     # before switching to the source site, or just go ahead and download
     # from there
     "confirm_crosspost": False,
+    # Save the platform's captions alongside the video: a plain-text
+    # transcript (.txt), closed captions (.srt), or both. When either is on,
+    # each download gets its own subfolder (several files arrive per video).
+    "transcript_txt": False,
+    "transcript_srt": False,
 }
 
 # Quality presets for auto download and the extension API: a yt-dlp format
@@ -165,6 +171,8 @@ def load_settings(base_path):
         if settings.get("auto_download_quality") not in ("best", "medium", "low"):
             settings["auto_download_quality"] = DEFAULT_SETTINGS["auto_download_quality"]
         settings["confirm_crosspost"] = bool(settings.get("confirm_crosspost"))
+        settings["transcript_txt"] = bool(settings.get("transcript_txt"))
+        settings["transcript_srt"] = bool(settings.get("transcript_srt"))
     except Exception:
         return dict(DEFAULT_SETTINGS)
     return settings
@@ -212,7 +220,142 @@ def site_ydl_opts(url, settings):
     return opts
 
 
-def run_with_cookie_fallback(ydl_opts, action):
+# Subtitle tracks to request for transcripts: exact 'en' (manual or
+# auto-generated English), 'eng.*' (TikTok labels English 'eng-US'), and
+# the platform's original-language auto captions (YouTube marks the
+# original ASR track '<lang>-orig'). Deliberately narrow: yt-dlp matches
+# these as case-INSENSITIVE regexes, and anything like 'en.*' also pulls
+# YouTube's dozens of auto-translated tracks ('en-de', ...), which gets
+# the download rate-limited (HTTP 429).
+TRANSCRIPT_SUB_LANGS = ['en', 'eng.*', '.*-orig']
+
+
+def transcript_enabled(settings):
+    return bool(settings.get('transcript_txt') or settings.get('transcript_srt'))
+
+
+def transcript_ydl_opts(settings):
+    """Extra yt-dlp options when transcript saving is on ({} when off).
+
+    Sites serve captions as VTT/JSON; the convertor normalizes whatever
+    arrives to SRT (ffmpeg). The TranscriptPostProcessor then derives the
+    .txt and removes formats the user didn't ask for.
+    """
+    if not transcript_enabled(settings):
+        return {}
+    return {
+        'writesubtitles': True,
+        'writeautomaticsub': True,
+        'subtitleslangs': list(TRANSCRIPT_SUB_LANGS),
+        'postprocessors': [
+            {'key': 'FFmpegSubtitlesConvertor', 'format': 'srt'}],
+    }
+
+
+def transcript_outtmpl(outtmpl, settings):
+    """Nest each download in its own folder when transcripts are on -
+    several files arrive per video, so give them a home named after it."""
+    if not transcript_enabled(settings) or not outtmpl.endswith('.%(ext)s'):
+        return outtmpl
+    stem = outtmpl[:-len('.%(ext)s')]
+    return f'{stem}/{outtmpl}'
+
+
+def srt_to_text(srt):
+    """Plain-text transcript from SRT: cue numbers, timestamps and inline
+    tags dropped, consecutive duplicate lines (rolling captions) collapsed."""
+    out = []
+    prev = None
+    for block in re.split(r'\r?\n\s*\r?\n', srt.strip()):
+        for line in block.splitlines():
+            line = re.sub(r'<[^>]+>', '', line).strip()
+            if not line or line.isdigit() or '-->' in line:
+                continue
+            if line != prev:
+                out.append(line)
+                prev = line
+    return '\n'.join(out) + '\n'
+
+
+class TranscriptPostProcessor(PostProcessor):
+    """Turns the downloaded caption files into what Settings asked for.
+
+    Runs after files reach their final folder: drops '<lang>-orig' tracks
+    that duplicate a same-language track, derives the .txt transcript, and
+    removes the .srt when only the text form was requested.
+    """
+
+    def __init__(self, want_txt, want_srt):
+        super().__init__(None)
+        self._want_txt = want_txt
+        self._want_srt = want_srt
+
+    def run(self, info):
+        subs = info.get('requested_subtitles') or {}
+        kept_bases = {lang.split('-')[0] for lang in subs
+                      if not lang.endswith('-orig')}
+        wrote_any = False
+        for lang, sub in sorted(subs.items()):
+            path = (sub or {}).get('filepath')
+            if not path or not os.path.exists(path):
+                continue
+            if lang.endswith('-orig') and lang[:-5].split('-')[0] in kept_bases:
+                os.remove(path)  # same language already covered
+                continue
+            if self._want_txt and path.lower().endswith('.srt'):
+                txt_path = path[:-4] + '.txt'
+                with open(path, encoding='utf-8', errors='replace') as f:
+                    text = srt_to_text(f.read())
+                with open(txt_path, 'w', encoding='utf-8') as f:
+                    f.write(text)
+                self.to_screen(f'Transcript saved: {os.path.basename(txt_path)}')
+                wrote_any = True
+            if not self._want_srt:
+                os.remove(path)
+            else:
+                wrote_any = True
+        if subs and not wrote_any:
+            self.to_screen('No usable captions were downloaded')
+        elif not subs:
+            self.to_screen('No captions available for this video - '
+                           'transcript not saved')
+        return [], info
+
+
+def transcript_post_processors(settings):
+    """Post-processors run_with_cookie_fallback should attach ([] when off)."""
+    if not transcript_enabled(settings):
+        return []
+    return [TranscriptPostProcessor(bool(settings.get('transcript_txt')),
+                                    bool(settings.get('transcript_srt')))]
+
+
+def run_download_with_transcripts(ydl_opts, settings, do_download):
+    """Download with transcript handling attached; transcripts are
+    best-effort - if fetching the captions themselves sinks the download
+    (rate limits and the like), retry once without them so the video still
+    arrives."""
+    try:
+        return run_with_cookie_fallback(
+            ydl_opts, do_download,
+            post_processors=transcript_post_processors(settings))
+    except Exception as e:
+        if not transcript_enabled(settings) or 'subtitle' not in str(e).lower():
+            raise
+        logger.warning('Caption download failed (%s); retrying without '
+                       'transcripts', e)
+        opts = {k: v for k, v in ydl_opts.items()
+                if k not in ('writesubtitles', 'writeautomaticsub',
+                             'subtitleslangs')}
+        pps = [pp for pp in opts.get('postprocessors', [])
+               if pp.get('key') != 'FFmpegSubtitlesConvertor']
+        opts.pop('postprocessors', None)
+        if pps:
+            opts['postprocessors'] = pps
+        return run_with_cookie_fallback(opts, do_download)
+
+
+def run_with_cookie_fallback(ydl_opts, action, post_processors=()):
     """Run action(ydl); if loading browser cookies fails, retry without them.
 
     Reading a browser's cookie DB fails routinely (the browser is running
@@ -228,6 +371,8 @@ def run_with_cookie_fallback(ydl_opts, action):
     """
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            for pp in post_processors:
+                ydl.add_post_processor(pp, when='after_move')
             return action(ydl)
     except Exception as e:
         err = str(e).lower()
@@ -247,6 +392,8 @@ def run_with_cookie_fallback(ydl_opts, action):
         opts = {k: v for k, v in ydl_opts.items() if k != 'cookiesfrombrowser'}
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
+                for pp in post_processors:
+                    ydl.add_post_processor(pp, when='after_move')
                 return action(ydl)
         except Exception as retry_error:
             raise Exception(
@@ -909,9 +1056,11 @@ class DownstreamApp:
         # Only prefix filenames with the playlist index for playlist downloads;
         # for single videos %(playlist_index)s expands to "NA"
         outtmpl = '%(playlist_index)s-%(title)s.%(ext)s' if is_playlist else '%(title)s.%(ext)s'
+        outtmpl = transcript_outtmpl(outtmpl, self.settings)
 
         ydl_opts = {
             **site_ydl_opts(url, self.settings),
+            **transcript_ydl_opts(self.settings),
             'outtmpl': outtmpl,
             'paths': build_download_paths(self.settings),
             'progress_hooks': [self.download_progress_hook],
@@ -961,10 +1110,10 @@ class DownstreamApp:
             if download_type == "video+audio":
                 ydl_opts['merge_output_format'] = self.settings['format']
             elif download_type == "audio-only":
-                ydl_opts['postprocessors'] = [{
+                ydl_opts.setdefault('postprocessors', []).append({
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
-                }]
+                })
         elif download_type == "video+audio":
             # Merge the chosen video with the best audio; fall back to the
             # bare format (progressive files already contain audio)
@@ -975,12 +1124,10 @@ class DownstreamApp:
         elif download_type == "video-only":
             ydl_opts['format'] = format_id
         else:
-            ydl_opts.update({
-                'format': format_id,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                }]
+            ydl_opts['format'] = format_id
+            ydl_opts.setdefault('postprocessors', []).append({
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
             })
 
         playlist_suffix = " (Playlist)" if is_playlist else ""
@@ -989,8 +1136,8 @@ class DownstreamApp:
         def download_thread():
             try:
                 self.root.after(0, self.status_var.set, "Downloading..." + playlist_suffix)
-                error_code = run_with_cookie_fallback(
-                    ydl_opts, lambda ydl: ydl.download([url]))
+                error_code = run_download_with_transcripts(
+                    ydl_opts, self.settings, lambda ydl: ydl.download([url]))
                 if error_code != 0:
                     # Only reachable with ignoreerrors (playlists): some
                     # entries failed but the rest were downloaded
@@ -1033,7 +1180,7 @@ class DownstreamApp:
 
     def save_settings(self, source_var, dest_var, type_var, format_var,
                       cookies_var, auto_var, quality_var, crosspost_var,
-                      settings_window):
+                      txt_var, srt_var, settings_window):
         source = source_var.get().strip()
         dest = dest_var.get().strip()
         if not os.path.isdir(dest):
@@ -1051,6 +1198,8 @@ class DownstreamApp:
         self.settings["auto_download"] = bool(auto_var.get())
         self.settings["auto_download_quality"] = quality_var.get()
         self.settings["confirm_crosspost"] = bool(crosspost_var.get())
+        self.settings["transcript_txt"] = bool(txt_var.get())
+        self.settings["transcript_srt"] = bool(srt_var.get())
         self.save_settings_file()
         # Apply the new default to the main window immediately
         self.download_type.set(type_var.get())
@@ -1157,6 +1306,19 @@ class DownstreamApp:
                         text="ask before downloading from the source site",
                         variable=crosspost_var).pack(side=tk.LEFT, padx=5)
 
+        # Transcripts: save the platform's captions with the video, as plain
+        # text, closed captions, or both. Downloads then get their own
+        # subfolder since several files arrive per video.
+        trans_frame = ttk.Frame(settings_frame)
+        trans_frame.pack(fill=tk.X, pady=3)
+        ttk.Label(trans_frame, text="Transcripts:", width=22).pack(side=tk.LEFT)
+        txt_var = tk.BooleanVar(value=bool(self.settings.get("transcript_txt")))
+        srt_var = tk.BooleanVar(value=bool(self.settings.get("transcript_srt")))
+        ttk.Checkbutton(trans_frame, text="plain text (.txt)",
+                        variable=txt_var).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(trans_frame, text="closed captions (.srt)",
+                        variable=srt_var).pack(side=tk.LEFT, padx=5)
+
         save_frame = ttk.Frame(settings_frame)
         save_frame.pack(fill=tk.X, pady=10)
         ttk.Button(save_frame, text="Save",
@@ -1164,6 +1326,7 @@ class DownstreamApp:
                                                       format_var, cookies_var,
                                                       auto_var, quality_var,
                                                       crosspost_var,
+                                                      txt_var, srt_var,
                                                       settings_window)).pack()
 
         # Size the window to its content rather than a fixed pixel geometry,
@@ -1276,8 +1439,9 @@ def api_download():
         app_settings = load_settings(get_base_path())
         ydl_opts = {
             **site_ydl_opts(video_url, app_settings),
+            **transcript_ydl_opts(app_settings),
             'format': selected_format,
-            'outtmpl': '%(title)s.%(ext)s',
+            'outtmpl': transcript_outtmpl('%(title)s.%(ext)s', app_settings),
             'paths': build_download_paths(app_settings),
             'merge_output_format': app_settings['format'],
             'concurrent_fragment_downloads': 4,
@@ -1288,8 +1452,9 @@ def api_download():
         # Start download in background thread
         def download_thread():
             try:
-                run_with_cookie_fallback(
-                    ydl_opts, lambda ydl: ydl.download([video_url]))
+                run_download_with_transcripts(
+                    ydl_opts, app_settings,
+                    lambda ydl: ydl.download([video_url]))
                 logger.info("Download completed successfully")
             except Exception as e:
                 logger.error(f"Download failed: {str(e)}")
