@@ -35,7 +35,7 @@ for _noisy in ('httpx', 'httpcore', 'huggingface_hub', 'faster_whisper'):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 APP_NAME = "Downstream"
-APP_VERSION = "1.6.14"
+APP_VERSION = "1.6.15"
 
 def get_base_path():
     """Get base path for resources, works both in development and when packaged"""
@@ -93,10 +93,10 @@ DEFAULT_SETTINGS = {
     # before switching to the source site, or just go ahead and download
     # from there
     "confirm_crosspost": False,
-    # Save the platform's captions alongside the video: a plain-text
-    # transcript (.txt), closed captions (.srt), or both. When either is on,
-    # each download gets its own subfolder (several files arrive per video).
-    "transcript_txt": False,
+    # Save a transcript alongside the video: a readable Markdown document
+    # (.md), closed captions (.srt), or both. When either is on, each
+    # download gets its own subfolder (several files arrive per video).
+    "transcript_md": False,
     "transcript_srt": False,
 }
 
@@ -172,7 +172,12 @@ def load_settings(base_path):
         settings_path = _migrate_legacy_file(base_path, "settings.json")
         if os.path.exists(settings_path):
             with open(settings_path, "r") as f:
-                settings.update(json.load(f))
+                saved = json.load(f)
+            # 1.6.13-1.6.14 saved the readable transcript as .txt under
+            # 'transcript_txt'; it is Markdown now
+            if "transcript_txt" in saved:
+                saved.setdefault("transcript_md", saved.pop("transcript_txt"))
+            settings.update(saved)
         # Fall back to defaults if saved paths don't exist (e.g. a settings
         # file created on another machine/OS)
         if not os.path.isdir(settings.get("download_path", "")):
@@ -183,7 +188,7 @@ def load_settings(base_path):
         if settings.get("auto_download_quality") not in ("best", "medium", "low"):
             settings["auto_download_quality"] = DEFAULT_SETTINGS["auto_download_quality"]
         settings["confirm_crosspost"] = bool(settings.get("confirm_crosspost"))
-        settings["transcript_txt"] = bool(settings.get("transcript_txt"))
+        settings["transcript_md"] = bool(settings.get("transcript_md"))
         settings["transcript_srt"] = bool(settings.get("transcript_srt"))
     except Exception:
         return dict(DEFAULT_SETTINGS)
@@ -246,9 +251,22 @@ TRANSCRIPT_SUB_LANGS = ['en.*']
 # downloaded once (~145 MB) into the config dir on first use.
 WHISPER_MODEL = 'base'
 
+# Whisper imitates the style of the text it is prompted with; without a
+# punctuated prompt, fast list-like speech came out nearly unpunctuated
+# (1.8 marks per 100 words vs ~22 with it). English-only: an English prompt
+# would pull other languages toward English.
+WHISPER_EN_PROMPT = ("Hello, and welcome. Today, I'll talk about three "
+                     "things: first, the plan; second, the cost. Let's begin!")
+
+# Voice-activity filtering skips silence and music, but the default
+# threshold dropped a whole spoken section of a fast-talking clip; these
+# looser settings kept it while still skipping long silences.
+WHISPER_VAD = {'threshold': 0.25, 'min_silence_duration_ms': 1000,
+               'speech_pad_ms': 600}
+
 
 def transcript_enabled(settings):
-    return bool(settings.get('transcript_txt') or settings.get('transcript_srt'))
+    return bool(settings.get('transcript_md') or settings.get('transcript_srt'))
 
 
 def transcript_ydl_opts(settings):
@@ -289,20 +307,268 @@ def transcript_outtmpl(outtmpl, settings):
     return f'{stem}/{stem}.%(ext)s'
 
 
-def srt_to_text(srt):
-    """Plain-text transcript from SRT: cue numbers, timestamps and inline
-    tags dropped, consecutive duplicate lines (rolling captions) collapsed."""
-    out = []
-    prev = None
+def parse_srt(srt):
+    """(start, end, text) cues from SRT text; inline tags stripped and
+    consecutive repeats (rolling captions) collapsed."""
+    cues = []
+    time_re = re.compile(
+        r'(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)')
     for block in re.split(r'\r?\n\s*\r?\n', srt.strip()):
-        for line in block.splitlines():
-            line = re.sub(r'<[^>]+>', '', line).strip()
-            if not line or line.isdigit() or '-->' in line:
-                continue
-            if line != prev:
-                out.append(line)
-                prev = line
-    return '\n'.join(out) + '\n'
+        lines = block.splitlines()
+        for i, line in enumerate(lines):
+            m = time_re.search(line)
+            if m:
+                break
+        else:
+            continue
+        h1, m1, s1, ms1, h2, m2, s2, ms2 = (int(g) for g in m.groups())
+        text = ' '.join(re.sub(r'<[^>]+>', '', l).strip()
+                        for l in lines[i + 1:]).strip()
+        if text and (not cues or cues[-1][2] != text):
+            cues.append((h1 * 3600 + m1 * 60 + s1 + ms1 / 1000,
+                         h2 * 3600 + m2 * 60 + s2 + ms2 / 1000, text))
+    return cues
+
+
+_SENTENCE_END = '.?!'
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.?!])["\')\]]?\s+')
+# A period after these doesn't end a sentence ("Trump Jr. made ...")
+_ABBREVIATIONS = {'mr.', 'mrs.', 'ms.', 'dr.', 'jr.', 'sr.', 'st.', 'vs.',
+                  'etc.', 'e.g.', 'i.e.', 'u.s.', 'no.', 'inc.', 'co.',
+                  'ltd.', 'mt.', 'ft.', 'approx.'}
+
+
+def _ends_sentence(text):
+    text = text.rstrip().rstrip('"\')]')
+    if not text.endswith(tuple(_SENTENCE_END)):
+        return False
+    return text.split()[-1].lower() not in _ABBREVIATIONS
+
+
+def _split_sentences(text):
+    """Sentence pieces of text, not splitting after abbreviations."""
+    pieces = []
+    for piece in _SENTENCE_SPLIT_RE.split(text.strip()):
+        if not piece.strip():
+            continue
+        if pieces and not _ends_sentence(pieces[-1]):
+            pieces[-1] += ' ' + piece
+        else:
+            pieces.append(piece)
+    return pieces
+
+# Spoken enumerations ("One, ban all stock trades. Two, ...") become
+# numbered lists
+_LIST_MARKERS = {
+    **{w: i for i, w in enumerate(
+        ('one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight',
+         'nine', 'ten'), 1)},
+    **{w: i for i, w in enumerate(
+        ('first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'seventh',
+         'eighth', 'ninth', 'tenth'), 1)},
+}
+_LIST_MARKER_RE = re.compile(
+    r'^(?:number\s+)?(?P<word>[a-z]+|\d{1,2})(?:ly)?\s*[,.:)-]\s*(?P<rest>[A-Za-z0-9"\'].*)$',
+    re.IGNORECASE)
+
+
+def _tidy_sentence(text):
+    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r'\s+([,.?!;:])', r'\1', text)
+    if text and text[0].islower():
+        text = text[0].upper() + text[1:]
+    text = re.sub(r'[,;:]+$', '', text)
+    if text and text[-1] not in _SENTENCE_END + '"\')':
+        text += '.'
+    return text
+
+
+def _sentences(segments):
+    """[(start_time, pause_before, sentence)] from transcript segments.
+
+    Fragments that don't end a sentence are carried into the next segment;
+    a sentence's start time is interpolated within its segment.
+    """
+    out = []
+    pending, pending_start, pending_pause = '', None, 0.0
+    prev_end = None
+    for start, end, text in segments:
+        pause = 0.0 if prev_end is None else max(0.0, start - prev_end)
+        prev_end = end
+        pieces = _split_sentences(text)
+        offset = 0
+        for piece in pieces:
+            at = start + (end - start) * (offset / max(len(text), 1))
+            offset += len(piece) + 1
+            if pending:
+                # A long pause ends an unpunctuated sentence anyway -
+                # unless it trails off mid-clause ("One," ... "ban all")
+                if (pause >= 1.5 and offset == len(piece) + 1
+                        and not pending.rstrip().endswith((',', ';', ':'))
+                        and len(pending.split()) >= 4):
+                    out.append((pending_start, pending_pause, _tidy_sentence(pending)))
+                    pending, pending_start, pending_pause = piece, at, pause
+                else:
+                    pending += ' ' + piece
+            else:
+                pending, pending_start = piece, at
+                pending_pause = pause if offset == len(piece) + 1 else 0.0
+            if _ends_sentence(pending):
+                out.append((pending_start, pending_pause, _tidy_sentence(pending)))
+                pending = ''
+    if pending:
+        out.append((pending_start, pending_pause, _tidy_sentence(pending)))
+    return out
+
+
+def _list_marker(sentence):
+    """(number, rest) when the sentence opens with a list marker."""
+    m = _LIST_MARKER_RE.match(sentence)
+    if not m:
+        return None
+    word = m.group('word').lower()
+    number = int(word) if word.isdigit() else _LIST_MARKERS.get(word)
+    return (number, _tidy_sentence(m.group('rest'))) if number else None
+
+
+def format_transcript(segments, pause=2.5, max_sentences=4, soft_limit=450):
+    """Readable blocks from transcript segments.
+
+    Returns ('para', start, text) and ('list', start, first_number,
+    [item, ...]) tuples: sentences re-flowed into paragraphs of a few
+    sentences (new paragraph at a pause in the speech), and spoken
+    enumerations of two or more consecutive items turned into lists.
+    """
+    sentences = _sentences(segments)
+    markers = [_list_marker(text) for _, _, text in sentences]
+
+    # Find list runs: markers counting up by one, at most 6 sentences apart
+    in_list = {}   # sentence index -> (run id, item number)
+    i = 0
+    while i < len(sentences):
+        if not markers[i]:
+            i += 1
+            continue
+        run = [i]
+        j = i + 1
+        while j < len(sentences) and j - run[-1] <= 6:
+            if markers[j] and markers[j][0] == markers[run[-1]][0] + 1:
+                run.append(j)
+            j += 1
+        if len(run) >= 2:
+            for n, idx in enumerate(run):
+                in_list[idx] = (i, n)
+            # Sentences following an item belong to it until the next
+            # item; after the last item, until a pause (at most 2 more)
+            for a, b in zip(run, run[1:] + [None]):
+                stop = b if b is not None else min(len(sentences), a + 3)
+                for k in range(a + 1, stop):
+                    if b is None and sentences[k][1] >= pause:
+                        break
+                    in_list[k] = (i, None)
+            i = max(in_list) + 1
+        else:
+            i += 1
+
+    blocks = []
+    para, para_start = [], None
+    k = 0
+    while k < len(sentences):
+        start, gap, text = sentences[k]
+        if k in in_list:
+            if para:
+                blocks.append(('para', para_start, ' '.join(para)))
+                para = []
+            run_id = in_list[k][0]
+            items, first = [], markers[k][0]
+            while k < len(sentences) and k in in_list and in_list[k][0] == run_id:
+                if in_list[k][1] is not None:
+                    items.append(markers[k][1])
+                else:
+                    items[-1] += ' ' + sentences[k][2]
+                k += 1
+            blocks.append(('list', start, first, items))
+            continue
+        if para and (gap >= pause or len(para) >= max_sentences
+                     or sum(len(t) + 1 for t in para) >= soft_limit):
+            blocks.append(('para', para_start, ' '.join(para)))
+            para = []
+        if not para:
+            para_start = start
+        para.append(text)
+        k += 1
+    if para:
+        blocks.append(('para', para_start, ' '.join(para)))
+    return blocks
+
+
+def _md_escape(text):
+    """Keep titles/captions from being read as Markdown formatting."""
+    return re.sub(r'([\\`*_\[\]<>#|])', r'\\\1', text)
+
+
+def _clock(seconds):
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f'{h}:{m:02}:{s:02}' if h else f'{m}:{s:02}'
+
+
+_LANGUAGE_NAMES = {
+    'en': 'English', 'es': 'Spanish', 'fr': 'French', 'de': 'German',
+    'it': 'Italian', 'pt': 'Portuguese', 'nl': 'Dutch', 'ru': 'Russian',
+    'uk': 'Ukrainian', 'pl': 'Polish', 'tr': 'Turkish', 'ar': 'Arabic',
+    'hi': 'Hindi', 'ja': 'Japanese', 'ko': 'Korean', 'zh': 'Chinese',
+}
+
+
+def transcript_markdown(info, segments, method):
+    """A readable Markdown transcript: title, source details, the post's
+    caption, then the text in timestamped paragraphs.
+
+    method describes where the text came from, e.g. "Speech recognition
+    (Whisper), English".
+    """
+    title = (info.get('title') or 'Transcript').strip()
+    if len(title) > 120:
+        title = title[:117].rstrip() + '...'
+    lines = [f'# {_md_escape(title)}', '']
+
+    details = []
+    url = info.get('webpage_url') or info.get('original_url')
+    if url:
+        details.append(f'**Source:** <{url}>')
+    author = info.get('uploader') or info.get('channel') or info.get('uploader_id')
+    if author:
+        details.append(f'**By:** {_md_escape(str(author))}')
+    date = info.get('upload_date')
+    if date and len(date) == 8:
+        details.append(f'**Posted:** {date[:4]}-{date[4:6]}-{date[6:]}')
+    if info.get('duration'):
+        details.append(f'**Length:** {_clock(info["duration"])}')
+    details.append(f'**Transcript:** {method}')
+    lines += [f'- {d}' for d in details] + ['']
+
+    # Instagram titles are just "Video by <user>"; the caption says what the
+    # post is about. Threads titles already are the caption.
+    caption = (info.get('description') or '').strip()
+    if caption and caption not in (info.get('title') or ''):
+        if len(caption) > 1500:
+            caption = caption[:1497].rstrip() + '...'
+        lines += ['> ' + _md_escape(l) if l.strip() else '>'
+                  for l in caption.splitlines()] + ['']
+
+    lines += ['---', '', '## Transcript', '']
+    for block in format_transcript(segments):
+        if block[0] == 'list':
+            _, start, first, items = block
+            lines += [f'**[{_clock(start)}]**', '']
+            lines += [f'{first + n}. {_md_escape(item)}'
+                      for n, item in enumerate(items)] + ['']
+        else:
+            _, start, text = block
+            lines += [f'**[{_clock(start)}]** {_md_escape(text)}', '']
+    return '\n'.join(lines).rstrip() + '\n'
 
 
 def _srt_timestamp(seconds):
@@ -313,39 +579,101 @@ def _srt_timestamp(seconds):
     return f'{h:02}:{m:02}:{s:02},{ms:03}'
 
 
+def _caption_lines(text, width=42):
+    """Split a cue into two lines near the middle when it is too wide."""
+    if len(text) <= width or ' ' not in text:
+        return text
+    middle = len(text) // 2
+    spaces = [i for i, c in enumerate(text) if c == ' ']
+    cut = min(spaces, key=lambda i: abs(i - middle))
+    return text[:cut] + '\n' + text[cut + 1:]
+
+
 def segments_to_srt(segments):
     """SRT text from (start, end, text) tuples."""
     cues = []
     for i, (start, end, text) in enumerate(segments, 1):
         cues.append(f'{i}\n{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n'
-                    f'{text}\n')
+                    f'{_caption_lines(text)}\n')
     return '\n'.join(cues)
 
 
 _whisper_model = None
+_whisper_pipeline = None
 _whisper_lock = threading.Lock()
+
+
+def words_to_cues(words, max_chars=84, max_seconds=6.0, pause=0.8):
+    """Caption cues (start, end, text) from timed words: a new cue at a
+    pause, when the cue gets long, or after a sentence ends."""
+    cues, current = [], []
+
+    def flush():
+        text = ''.join(w.word for w in current).strip()
+        if text:
+            cues.append((current[0].start, current[-1].end, text))
+        current.clear()
+
+    for word in words:
+        if current:
+            text = ''.join(w.word for w in current)
+            if (word.start - current[-1].end >= pause
+                    or word.end - current[0].start > max_seconds
+                    or len(text) + len(word.word) > max_chars):
+                flush()
+        current.append(word)
+        text = ''.join(w.word for w in current).strip()
+        if _ends_sentence(text) and len(text) >= 20:
+            flush()
+    if current:
+        flush()
+    return cues
 
 
 def transcribe_media(path):
     """Speech-to-text for a downloaded audio/video file with faster-whisper.
 
-    Returns ([(start, end, text), ...], language). Transcriptions run one at
-    a time: the model is shared, and each run already uses every CPU core.
+    Returns ([(start, end, text), ...], language) - caption-sized cues.
+    Transcriptions run one at a time: the model is shared, and each run
+    already uses every CPU core.
+
+    Uses the batched pipeline, which decodes each stretch of speech on its
+    own. Sequential decoding skipped 13 s of speech in a fast-talking clip
+    on every run (a timestamp jump past the next chunk), whatever the
+    temperature or conditioning settings; batched decoding kept it all,
+    and is faster. Word timestamps give caption-sized cues back.
     """
-    global _whisper_model
+    global _whisper_model, _whisper_pipeline
     # Imported lazily: loading ctranslate2/onnxruntime costs startup time
     # and memory that downloads without transcripts don't need
-    from faster_whisper import WhisperModel
+    from faster_whisper import (BatchedInferencePipeline, WhisperModel,
+                                decode_audio)
+    from faster_whisper.vad import VadOptions
     with _whisper_lock:
         if _whisper_model is None:
             _whisper_model = WhisperModel(
                 WHISPER_MODEL, device='cpu', compute_type='int8',
                 download_root=os.path.join(get_config_dir(), 'models'))
-        segments, info = _whisper_model.transcribe(
-            path, vad_filter=True, beam_size=5)
-        result = [(seg.start, seg.end, seg.text.strip())
-                  for seg in segments if seg.text.strip()]
-    return result, info.language
+            _whisper_pipeline = BatchedInferencePipeline(model=_whisper_model)
+        audio = decode_audio(path)
+        try:
+            # Unlike transcribe(), detect_language() needs a VadOptions,
+            # not a dict
+            language, _, _ = _whisper_model.detect_language(
+                audio, vad_filter=True,
+                vad_parameters=VadOptions(**WHISPER_VAD))
+        except Exception:
+            # No speech to detect from (music-only clips); let
+            # transcribe() decide, without the English prompt
+            logger.warning('Language detection failed for %s', path,
+                           exc_info=True)
+            language = None
+        segments, info = _whisper_pipeline.transcribe(
+            audio, language=language, beam_size=5, batch_size=8,
+            vad_parameters=WHISPER_VAD, word_timestamps=True,
+            initial_prompt=WHISPER_EN_PROMPT if language == 'en' else None)
+        words = [w for seg in segments for w in (seg.words or [])]
+    return words_to_cues(words), info.language
 
 
 class TranscriptPostProcessor(PostProcessor):
@@ -358,9 +686,9 @@ class TranscriptPostProcessor(PostProcessor):
     status bar but never fails the download itself.
     """
 
-    def __init__(self, want_txt, want_srt, status=None):
+    def __init__(self, want_md, want_srt, status=None):
         super().__init__(None)
-        self._want_txt = want_txt
+        self._want_md = want_md
         self._want_srt = want_srt
         self._status = status or (lambda message: None)
 
@@ -389,9 +717,10 @@ class TranscriptPostProcessor(PostProcessor):
         stem = os.path.splitext(media)[0]
         if self._want_srt:
             self._write(stem + '.srt', segments_to_srt(segments))
-        if self._want_txt:
-            self._write(stem + '.txt',
-                        '\n'.join(text for _, _, text in segments) + '\n')
+        if self._want_md:
+            name = _LANGUAGE_NAMES.get(language, language)
+            self._write(stem + '.md', transcript_markdown(
+                info, segments, f'Speech recognition (Whisper), {name}'))
         logger.info('Transcribed %s (%s, %d segments)', media, language,
                     len(segments))
         return [], info
@@ -407,9 +736,12 @@ class TranscriptPostProcessor(PostProcessor):
             if not path.lower().endswith('.srt'):
                 os.remove(path)  # ffmpeg couldn't convert it; unusable
                 continue
-            if self._want_txt:
+            if self._want_md:
                 with open(path, encoding='utf-8', errors='replace') as f:
-                    self._write(path[:-4] + '.txt', srt_to_text(f.read()))
+                    cues = parse_srt(f.read())
+                site = info.get('extractor_key') or 'the site'
+                self._write(path[:-4] + '.md', transcript_markdown(
+                    info, cues, f'Captions from {site} ({lang})'))
             if not self._want_srt:
                 os.remove(path)
             wrote_any = True
@@ -423,7 +755,7 @@ def transcript_post_processors(settings, status=None):
     """
     if not transcript_enabled(settings):
         return []
-    return [TranscriptPostProcessor(bool(settings.get('transcript_txt')),
+    return [TranscriptPostProcessor(bool(settings.get('transcript_md')),
                                     bool(settings.get('transcript_srt')),
                                     status)]
 
@@ -1290,7 +1622,7 @@ class DownstreamApp:
 
     def save_settings(self, source_var, dest_var, type_var, format_var,
                       cookies_var, auto_var, quality_var, crosspost_var,
-                      txt_var, srt_var, settings_window):
+                      md_var, srt_var, settings_window):
         source = source_var.get().strip()
         dest = dest_var.get().strip()
         if not os.path.isdir(dest):
@@ -1308,7 +1640,7 @@ class DownstreamApp:
         self.settings["auto_download"] = bool(auto_var.get())
         self.settings["auto_download_quality"] = quality_var.get()
         self.settings["confirm_crosspost"] = bool(crosspost_var.get())
-        self.settings["transcript_txt"] = bool(txt_var.get())
+        self.settings["transcript_md"] = bool(md_var.get())
         self.settings["transcript_srt"] = bool(srt_var.get())
         self.save_settings_file()
         # Apply the new default to the main window immediately
@@ -1416,16 +1748,16 @@ class DownstreamApp:
                         text="ask before downloading from the source site",
                         variable=crosspost_var).pack(side=tk.LEFT, padx=5)
 
-        # Transcripts: save the platform's captions with the video, as plain
-        # text, closed captions, or both. Downloads then get their own
+        # Transcripts: save a transcript with the video, as a readable
+        # Markdown document, closed captions, or both. Downloads then get their own
         # subfolder since several files arrive per video.
         trans_frame = ttk.Frame(settings_frame)
         trans_frame.pack(fill=tk.X, pady=3)
         ttk.Label(trans_frame, text="Transcripts:", width=22).pack(side=tk.LEFT)
-        txt_var = tk.BooleanVar(value=bool(self.settings.get("transcript_txt")))
+        md_var = tk.BooleanVar(value=bool(self.settings.get("transcript_md")))
         srt_var = tk.BooleanVar(value=bool(self.settings.get("transcript_srt")))
-        ttk.Checkbutton(trans_frame, text="plain text (.txt)",
-                        variable=txt_var).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(trans_frame, text="readable (.md)",
+                        variable=md_var).pack(side=tk.LEFT, padx=5)
         ttk.Checkbutton(trans_frame, text="closed captions (.srt)",
                         variable=srt_var).pack(side=tk.LEFT, padx=5)
 
@@ -1436,7 +1768,7 @@ class DownstreamApp:
                                                       format_var, cookies_var,
                                                       auto_var, quality_var,
                                                       crosspost_var,
-                                                      txt_var, srt_var,
+                                                      md_var, srt_var,
                                                       settings_window)).pack()
 
         # Size the window to its content rather than a fixed pixel geometry,
