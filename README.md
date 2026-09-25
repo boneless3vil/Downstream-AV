@@ -121,13 +121,15 @@ Then install ffmpeg (and ideally Deno) with your system's package manager.
      another supported site (e.g. an Instagram reel shared to Threads) the
      app downloads it from there. Tick "ask before downloading from the
      source site" to get a confirmation dialog first (off by default).
-   - Transcripts: save the platform's captions alongside the video as a
-     plain-text transcript (.txt), closed captions (.srt), or both. When
-     either is on, each download is placed in its own subfolder named
-     after the video. English and original-language auto captions are
-     used when the site provides them (YouTube nearly always, TikTok
-     sometimes, Instagram/Threads rarely); videos without captions still
-     download, just without a transcript.
+   - Transcripts: save a transcript with every download as plain text
+     (.txt), closed captions (.srt), or both. When either is on, each
+     download is placed in its own subfolder named after the video (the
+     name is shortened if needed to stay within Windows' path limit).
+     Human-made English captions are used when the site has them;
+     otherwise the audio is transcribed locally with Whisper
+     (faster-whisper, 'base' model) - offline, on the CPU, roughly 10x
+     faster than real time. The model (~140 MB) is downloaded once on
+     first use into %APPDATA%\Downstream\models.
 
 5. History (title-bar icon menu, "Download History..."):
    - View past downloads with timestamp, format, and status

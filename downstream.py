@@ -15,15 +15,27 @@ import pyperclip
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+# The windowed exe has no console, so sys.stdout/stderr are None there.
+# Libraries that print progress (the Whisper model download's progress bar)
+# would crash writing to them; point them at devnull instead.
+for _stream in ('stdout', 'stderr'):
+    if getattr(sys, _stream) is None:
+        setattr(sys, _stream, open(os.devnull, 'w', encoding='utf-8'))
+os.environ.setdefault('HF_HUB_DISABLE_PROGRESS_BARS', '1')
+os.environ.setdefault('HF_HUB_DISABLE_SYMLINKS_WARNING', '1')
+
 # Configure logging with more detailed format
 logging.basicConfig(
     level=logging.DEBUG,  # Changed to DEBUG for more verbose logging
     format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
 )
 logger = logging.getLogger(__name__)
+# The Whisper model loader's HTTP client logs every request at DEBUG
+for _noisy in ('httpx', 'httpcore', 'huggingface_hub', 'faster_whisper'):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 APP_NAME = "Downstream"
-APP_VERSION = "1.6.13"
+APP_VERSION = "1.6.14"
 
 def get_base_path():
     """Get base path for resources, works both in development and when packaged"""
@@ -220,14 +232,19 @@ def site_ydl_opts(url, settings):
     return opts
 
 
-# Subtitle tracks to request for transcripts: exact 'en' (manual or
-# auto-generated English), 'eng.*' (TikTok labels English 'eng-US'), and
-# the platform's original-language auto captions (YouTube marks the
-# original ASR track '<lang>-orig'). Deliberately narrow: yt-dlp matches
-# these as case-INSENSITIVE regexes, and anything like 'en.*' also pulls
-# YouTube's dozens of auto-translated tracks ('en-de', ...), which gets
-# the download rate-limited (HTTP 429).
-TRANSCRIPT_SUB_LANGS = ['en', 'eng.*', '.*-orig']
+# Human-made subtitle tracks to prefer over speech recognition when a site
+# has them: English in any region variant ('en', 'en-GB', TikTok's
+# 'eng-US'). Only *manual* subtitles are requested - auto-generated
+# captions are skipped because local Whisper transcription reads better
+# (punctuation, no rolling duplicates), and YouTube lists dozens of
+# auto-translated caption tracks that 'en.*' would also match and that
+# get the download rate-limited (HTTP 429).
+TRANSCRIPT_SUB_LANGS = ['en.*']
+
+# Whisper model for local speech-to-text. 'base' transcribes a 60 s reel in
+# ~5 s on CPU with near-identical text to 'small' (3x slower); it is
+# downloaded once (~145 MB) into the config dir on first use.
+WHISPER_MODEL = 'base'
 
 
 def transcript_enabled(settings):
@@ -237,15 +254,14 @@ def transcript_enabled(settings):
 def transcript_ydl_opts(settings):
     """Extra yt-dlp options when transcript saving is on ({} when off).
 
-    Sites serve captions as VTT/JSON; the convertor normalizes whatever
-    arrives to SRT (ffmpeg). The TranscriptPostProcessor then derives the
-    .txt and removes formats the user didn't ask for.
+    Requests the site's human-made English subtitles, normalized to SRT by
+    ffmpeg. When there are none (Instagram, Threads, and most TikTok and
+    YouTube videos), TranscriptPostProcessor transcribes the audio itself.
     """
     if not transcript_enabled(settings):
         return {}
     return {
         'writesubtitles': True,
-        'writeautomaticsub': True,
         'subtitleslangs': list(TRANSCRIPT_SUB_LANGS),
         'postprocessors': [
             {'key': 'FFmpegSubtitlesConvertor', 'format': 'srt'}],
@@ -254,11 +270,23 @@ def transcript_ydl_opts(settings):
 
 def transcript_outtmpl(outtmpl, settings):
     """Nest each download in its own folder when transcripts are on -
-    several files arrive per video, so give them a home named after it."""
+    several files arrive per video, so give them a home named after it.
+
+    The title then appears twice in the path (folder and file), and
+    Instagram/Threads titles are whole post captions. Windows paths stop at
+    260 characters unless long paths are enabled, and past that the
+    download fails outright, so the title is trimmed to fit the configured
+    folders with room left for yt-dlp's temporary suffixes
+    ('.fdash-1107942951774716a.m4a.part').
+    """
     if not transcript_enabled(settings) or not outtmpl.endswith('.%(ext)s'):
         return outtmpl
-    stem = outtmpl[:-len('.%(ext)s')]
-    return f'{stem}/{outtmpl}'
+    base = max(len(settings.get('download_path') or ''),
+               len(settings.get('temp_path') or ''))
+    title_bytes = max(16, min(80, (250 - base - 45) // 2))
+    stem = outtmpl[:-len('.%(ext)s')].replace(
+        '%(title)s', f'%(title).{title_bytes}B')
+    return f'{stem}/{stem}.%(ext)s'
 
 
 def srt_to_text(srt):
@@ -277,82 +305,152 @@ def srt_to_text(srt):
     return '\n'.join(out) + '\n'
 
 
-class TranscriptPostProcessor(PostProcessor):
-    """Turns the downloaded caption files into what Settings asked for.
+def _srt_timestamp(seconds):
+    ms = int(round(seconds * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f'{h:02}:{m:02}:{s:02},{ms:03}'
 
-    Runs after files reach their final folder: drops '<lang>-orig' tracks
-    that duplicate a same-language track, derives the .txt transcript, and
-    removes the .srt when only the text form was requested.
+
+def segments_to_srt(segments):
+    """SRT text from (start, end, text) tuples."""
+    cues = []
+    for i, (start, end, text) in enumerate(segments, 1):
+        cues.append(f'{i}\n{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n'
+                    f'{text}\n')
+    return '\n'.join(cues)
+
+
+_whisper_model = None
+_whisper_lock = threading.Lock()
+
+
+def transcribe_media(path):
+    """Speech-to-text for a downloaded audio/video file with faster-whisper.
+
+    Returns ([(start, end, text), ...], language). Transcriptions run one at
+    a time: the model is shared, and each run already uses every CPU core.
+    """
+    global _whisper_model
+    # Imported lazily: loading ctranslate2/onnxruntime costs startup time
+    # and memory that downloads without transcripts don't need
+    from faster_whisper import WhisperModel
+    with _whisper_lock:
+        if _whisper_model is None:
+            _whisper_model = WhisperModel(
+                WHISPER_MODEL, device='cpu', compute_type='int8',
+                download_root=os.path.join(get_config_dir(), 'models'))
+        segments, info = _whisper_model.transcribe(
+            path, vad_filter=True, beam_size=5)
+        result = [(seg.start, seg.end, seg.text.strip())
+                  for seg in segments if seg.text.strip()]
+    return result, info.language
+
+
+class TranscriptPostProcessor(PostProcessor):
+    """Writes the transcript files Settings asked for, after the download
+    reaches its final folder.
+
+    Uses the site's human-made subtitles when yt-dlp fetched some;
+    otherwise transcribes the downloaded audio locally with Whisper.
+    Transcription is best-effort: a failure is logged and reported in the
+    status bar but never fails the download itself.
     """
 
-    def __init__(self, want_txt, want_srt):
+    def __init__(self, want_txt, want_srt, status=None):
         super().__init__(None)
         self._want_txt = want_txt
         self._want_srt = want_srt
+        self._status = status or (lambda message: None)
+
+    def _write(self, path, text):
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
+        self.to_screen(f'Transcript saved: {os.path.basename(path)}')
 
     def run(self, info):
-        subs = info.get('requested_subtitles') or {}
-        kept_bases = {lang.split('-')[0] for lang in subs
-                      if not lang.endswith('-orig')}
+        if self._use_site_subtitles(info):
+            return [], info
+        media = info.get('filepath')
+        if not media or not os.path.exists(media):
+            return [], info
+        self._status('Transcribing audio...')
+        try:
+            segments, language = transcribe_media(media)
+        except Exception as e:
+            logger.error('Transcription failed for %s', media, exc_info=True)
+            self._status(f'Download complete - transcription failed: {e}')
+            return [], info
+        if not segments:
+            self.to_screen('No speech detected - transcript not saved')
+            self._status('Download complete - no speech to transcribe')
+            return [], info
+        stem = os.path.splitext(media)[0]
+        if self._want_srt:
+            self._write(stem + '.srt', segments_to_srt(segments))
+        if self._want_txt:
+            self._write(stem + '.txt',
+                        '\n'.join(text for _, _, text in segments) + '\n')
+        logger.info('Transcribed %s (%s, %d segments)', media, language,
+                    len(segments))
+        return [], info
+
+    def _use_site_subtitles(self, info):
+        """Turn subtitle files yt-dlp downloaded into the requested
+        formats. False when there were none, so the caller transcribes."""
         wrote_any = False
-        for lang, sub in sorted(subs.items()):
+        for lang, sub in sorted((info.get('requested_subtitles') or {}).items()):
             path = (sub or {}).get('filepath')
             if not path or not os.path.exists(path):
                 continue
-            if lang.endswith('-orig') and lang[:-5].split('-')[0] in kept_bases:
-                os.remove(path)  # same language already covered
+            if not path.lower().endswith('.srt'):
+                os.remove(path)  # ffmpeg couldn't convert it; unusable
                 continue
-            if self._want_txt and path.lower().endswith('.srt'):
-                txt_path = path[:-4] + '.txt'
+            if self._want_txt:
                 with open(path, encoding='utf-8', errors='replace') as f:
-                    text = srt_to_text(f.read())
-                with open(txt_path, 'w', encoding='utf-8') as f:
-                    f.write(text)
-                self.to_screen(f'Transcript saved: {os.path.basename(txt_path)}')
-                wrote_any = True
+                    self._write(path[:-4] + '.txt', srt_to_text(f.read()))
             if not self._want_srt:
                 os.remove(path)
-            else:
-                wrote_any = True
-        if subs and not wrote_any:
-            self.to_screen('No usable captions were downloaded')
-        elif not subs:
-            self.to_screen('No captions available for this video - '
-                           'transcript not saved')
-        return [], info
+            wrote_any = True
+        return wrote_any
 
 
-def transcript_post_processors(settings):
-    """Post-processors run_with_cookie_fallback should attach ([] when off)."""
+def transcript_post_processors(settings, status=None):
+    """Post-processors run_with_cookie_fallback should attach ([] when off).
+
+    status, if given, is called with short progress messages for the UI.
+    """
     if not transcript_enabled(settings):
         return []
     return [TranscriptPostProcessor(bool(settings.get('transcript_txt')),
-                                    bool(settings.get('transcript_srt')))]
+                                    bool(settings.get('transcript_srt')),
+                                    status)]
 
 
-def run_download_with_transcripts(ydl_opts, settings, do_download):
-    """Download with transcript handling attached; transcripts are
-    best-effort - if fetching the captions themselves sinks the download
-    (rate limits and the like), retry once without them so the video still
-    arrives."""
+def run_download_with_transcripts(ydl_opts, settings, do_download, status=None):
+    """Download with transcript handling attached. Transcripts are
+    best-effort: if fetching the site's subtitles sinks the download (rate
+    limits and the like), retry once without them - the video still
+    arrives and its audio is transcribed instead."""
+    post_processors = transcript_post_processors(settings, status)
     try:
         return run_with_cookie_fallback(
-            ydl_opts, do_download,
-            post_processors=transcript_post_processors(settings))
+            ydl_opts, do_download, post_processors=post_processors)
     except Exception as e:
         if not transcript_enabled(settings) or 'subtitle' not in str(e).lower():
             raise
-        logger.warning('Caption download failed (%s); retrying without '
-                       'transcripts', e)
+        logger.warning('Subtitle download failed (%s); retrying without '
+                       'site subtitles', e)
         opts = {k: v for k, v in ydl_opts.items()
-                if k not in ('writesubtitles', 'writeautomaticsub',
-                             'subtitleslangs')}
+                if k not in ('writesubtitles', 'subtitleslangs')}
         pps = [pp for pp in opts.get('postprocessors', [])
                if pp.get('key') != 'FFmpegSubtitlesConvertor']
         opts.pop('postprocessors', None)
         if pps:
             opts['postprocessors'] = pps
-        return run_with_cookie_fallback(opts, do_download)
+        return run_with_cookie_fallback(
+            opts, do_download, post_processors=post_processors)
 
 
 def run_with_cookie_fallback(ydl_opts, action, post_processors=()):
@@ -1134,17 +1232,29 @@ class DownstreamApp:
         format_desc = f'auto-{auto_quality}' if auto_quality else format_id
 
         def download_thread():
+            # Transcript problems end in a "Download complete - ..." status;
+            # keep that on screen instead of the generic completion message
+            transcript_notes = []
+
+            def report(msg):
+                if msg.startswith("Download complete - "):
+                    transcript_notes.append(msg)
+                self.root.after(0, self.status_var.set, msg)
+
             try:
                 self.root.after(0, self.status_var.set, "Downloading..." + playlist_suffix)
                 error_code = run_download_with_transcripts(
-                    ydl_opts, self.settings, lambda ydl: ydl.download([url]))
+                    ydl_opts, self.settings, lambda ydl: ydl.download([url]),
+                    status=report)
                 if error_code != 0:
                     # Only reachable with ignoreerrors (playlists): some
                     # entries failed but the rest were downloaded
                     raise Exception("Some playlist entries could not be downloaded "
                                     "(see download history for details)")
 
-                self.root.after(0, self.status_var.set, "Download completed!")
+                self.root.after(0, self.status_var.set,
+                                transcript_notes[-1] if transcript_notes
+                                else "Download completed!")
                 self.root.after(0, self.flash_status)
                 self.root.after(0, self.progress_var.set, 100)
                 self.log_download(url, f"{download_type}:{format_desc}", "Success" + playlist_suffix)
