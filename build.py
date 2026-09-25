@@ -91,6 +91,13 @@ if os.name == 'nt':  # Windows-specific initialization
         '--hidden-import=json',
         '--collect-all=yt_dlp',
         '--collect-all=pyperclip',
+        # Local speech-to-text for transcripts: faster_whisper ships its
+        # voice-activity model as a data file (assets/silero_vad_v6.onnx)
+        # and ctranslate2 its inference DLLs, neither found by import
+        # analysis alone. huggingface_hub (model download) imports lazily.
+        '--collect-all=faster_whisper',
+        '--collect-all=ctranslate2',
+        '--collect-submodules=huggingface_hub',
         '--runtime-hook=runtime-hook.py',
         '--clean',
         '--disable-windowed-traceback',
