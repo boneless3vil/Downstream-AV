@@ -146,6 +146,25 @@ Then install ffmpeg (and ideally Deno) with your system's package manager.
 5. History (title-bar icon menu, "Download History..."):
    - View past downloads with timestamp, format, and status
 
+6. Convert Files / Convert Folder (buttons at the bottom right, or the
+   title-bar icon menu):
+   - Pick videos already on your drive - or a whole folder, including its
+     subfolders - and convert them to H.264 + AAC (plays and uploads
+     everywhere) or AV1 + AAC (smallest files). Each result is saved next
+     to the original as `<name> (H.264).mp4` or `<name> (AV1).mp4`;
+     originals are never changed or overwritten.
+   - Videos that already have a converted copy are skipped, so converting
+     a folder again only handles new videos. Folders always show how many
+     videos they hold and ask before starting.
+   - You can also drag videos or folders onto Downstream.exe (or its
+     shortcut), or right-click a video > Open with > Downstream. If
+     Downstream is already running, they are handed to that window.
+   - Settings > "Convert files to" picks the format; with "convert right
+     away, without asking" off, Downstream asks each time instead.
+   - Streams already in the target format are copied, not re-encoded;
+     files already fully in the format are skipped. Conversions use the
+     graphics card when available (NVIDIA, Intel, AMD), with live progress.
+
 ## Built-in server for the Chrome extension
 
 The desktop app doubles as the backend for the companion Chrome extension —
