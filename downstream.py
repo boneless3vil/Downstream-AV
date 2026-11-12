@@ -10,7 +10,9 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
+import urllib.request
 import sys
 import logging
 from datetime import datetime
@@ -38,7 +40,7 @@ for _noisy in ('httpx', 'httpcore', 'huggingface_hub', 'faster_whisper'):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 APP_NAME = "Downstream"
-APP_VERSION = "1.6.16"
+APP_VERSION = "1.6.17"
 
 def get_base_path():
     """Get base path for resources, works both in development and when packaged"""
@@ -105,6 +107,10 @@ DEFAULT_SETTINGS = {
     # are AV1/VP9 video with Opus audio, which many Windows apps can't play
     # and some upload sites reject; the default saves H.264 + AAC instead.
     "video_codec": "h264",
+    # Convert Files... (and files opened with / dropped on Downstream):
+    # target format, and whether to start right away or ask each time
+    "convert_target": "h264",
+    "convert_without_asking": True,
 }
 
 # Quality presets for auto download and the extension API: a yt-dlp format
@@ -226,6 +232,9 @@ def load_settings(base_path):
         settings["confirm_crosspost"] = bool(settings.get("confirm_crosspost"))
         if settings.get("video_codec") not in VIDEO_CODECS:
             settings["video_codec"] = DEFAULT_SETTINGS["video_codec"]
+        if settings.get("convert_target") not in CONVERT_TARGETS:
+            settings["convert_target"] = DEFAULT_SETTINGS["convert_target"]
+        settings["convert_without_asking"] = bool(settings.get("convert_without_asking"))
         settings["transcript_md"] = bool(settings.get("transcript_md"))
         settings["transcript_srt"] = bool(settings.get("transcript_srt"))
     except Exception:
@@ -789,30 +798,83 @@ class TranscriptPostProcessor(PostProcessor):
 # H.264 encoders to try for conversions, best first: GPU encoders are many
 # times faster than libx264 for 4K. Each is probed once (an ffmpeg build
 # lists NVENC/QSV/AMF whether or not the hardware is present).
-_H264_ENCODERS = [
-    ('h264_nvenc', ['-c:v', 'h264_nvenc', '-preset', 'p5', '-tune', 'hq',
-                    '-rc', 'vbr']),
-    ('h264_qsv', ['-c:v', 'h264_qsv', '-preset', 'slow']),
-    ('h264_amf', ['-c:v', 'h264_amf', '-quality', 'quality', '-rc', 'vbr_peak']),
-    ('libx264', ['-c:v', 'libx264', '-preset', 'fast']),
-]
-_h264_encoder_ok = {}
+# Output formats for conversions (downloads in H.264 mode, and files opened
+# with Convert Files...). 'encoders' are tried best first - GPU encoders
+# are many times faster than software ones; each is probed once, since
+# ffmpeg builds list NVENC/QSV/AMF whether or not the hardware is present.
+# 'bpp' is the bitrate range in bits per pixel per frame and 'scale' the
+# share of the H.264-equivalent bitrate the codec needs (see
+# conversion_bitrate).
+CONVERT_TARGETS = {
+    'h264': {
+        'label': 'H.264 + AAC (.mp4) - plays and uploads everywhere',
+        'name': 'H.264', 'codec': 'h264', 'scale': 1.0, 'bpp': (0.03, 0.06),
+        'encoders': [
+            ('h264_nvenc', ['-c:v', 'h264_nvenc', '-preset', 'p5',
+                            '-tune', 'hq', '-rc', 'vbr']),
+            ('h264_qsv', ['-c:v', 'h264_qsv', '-preset', 'slow']),
+            ('h264_amf', ['-c:v', 'h264_amf', '-quality', 'quality',
+                          '-rc', 'vbr_peak']),
+            ('libx264', ['-c:v', 'libx264', '-preset', 'fast']),
+        ],
+    },
+    'av1': {
+        'label': 'AV1 + AAC (.mp4) - smallest files',
+        'name': 'AV1', 'codec': 'av1', 'scale': 0.7, 'bpp': (0.021, 0.042),
+        'encoders': [
+            ('av1_nvenc', ['-c:v', 'av1_nvenc', '-preset', 'p5',
+                           '-tune', 'hq', '-rc', 'vbr']),
+            ('av1_qsv', ['-c:v', 'av1_qsv', '-preset', 'slow']),
+            ('av1_amf', ['-c:v', 'av1_amf', '-quality', 'quality',
+                         '-rc', 'vbr_peak']),
+            ('libsvtav1', ['-c:v', 'libsvtav1', '-preset', '8']),
+            # Last resort: works everywhere, but far slower than real time
+            ('libaom-av1', ['-c:v', 'libaom-av1', '-cpu-used', '8',
+                            '-row-mt', '1']),
+        ],
+    },
+}
+
+# Bits of H.264 that one bit of each source codec is worth at equal
+# quality, roughly. Unknown codecs (MPEG-4 Part 2, ...) count as H.264.
+_H264_EQUIVALENT = {'av1': 3.0, 'vp9': 1.5, 'hevc': 1.5}
+
+_encoder_ok = {}
+_ffmpeg = None
 
 
-def h264_target_bitrate(video, fmt):
-    """Bitrate (bits/s) for converting a video stream to H.264.
+class ConversionError(Exception):
+    pass
 
-    Sized for social-media posting, where the site re-encodes anyway:
-    - a multiple of the source bitrate: 3x for AV1 (H.264 needs about 2-3x
-      AV1's bitrate; measured on a 1080p AV1 download, VMAF 95 -
-      indistinguishable - at 2.7x the source size), 1.5x for VP9/HEVC
-      (YouTube's VP9 runs ~5x AV1's bitrate for the same video)
-    - capped at 0.06 bits per pixel per frame: ~3.7 Mbps for a 1080p30
-      Short, ~8.4 Mbps for 4K24 (a hand-made Facebook upload of the same
-      4K video used 8.3 Mbps; H.264 at 8 Mbps measured near-lossless
-      against YouTube's 10 Mbps VP9)
-    - at least 0.03 bits per pixel per frame for very lean sources
+
+class NotAVideoError(ConversionError):
+    pass
+
+
+def _ffmpeg_tools():
+    """yt-dlp's ffmpeg helper: finds ffmpeg/ffprobe the same way downloads do."""
+    global _ffmpeg
+    if _ffmpeg is None:
+        _ffmpeg = FFmpegPostProcessor(None)
+    return _ffmpeg
+
+
+def conversion_bitrate(video, fmt, target):
+    """Video bitrate (bits/s) for converting a stream to the target codec.
+
+    Sized for social-media posting, where the site re-encodes anyway: the
+    source bitrate converted to its H.264 equivalent (3x for AV1 - measured
+    on a 1080p AV1 download, H.264 at 2.7x the size scored VMAF 95,
+    indistinguishable - and 1.5x for VP9/HEVC, whose YouTube streams run
+    ~5x AV1's bitrate for the same video), times the target codec's share
+    (AV1 at 0.7x a YouTube H.264 stream's bitrate scored VMAF 94 with
+    NVENC; 0.5x dropped to 91.6), clamped to the target's bits-per-pixel
+    range. For H.264 that cap is ~3.7 Mbps for a 1080p30
+    Short and ~8.4 Mbps for 4K24 (a hand-made Facebook upload of a 4K
+    video used 8.3 Mbps; H.264 at 8 Mbps measured near-lossless against
+    YouTube's 10 Mbps VP9).
     """
+    spec = CONVERT_TARGETS[target]
     width = int(video.get('width') or 1920)
     height = int(video.get('height') or 1080)
     try:
@@ -821,94 +883,196 @@ def h264_target_bitrate(video, fmt):
     except (ValueError, ZeroDivisionError):
         fps = 0
     pixel_rate = width * height * (fps or 30)
+    low, high = (pixel_rate * b for b in spec['bpp'])
     source = int(video.get('bit_rate') or 0)
     if not source and fmt.get('bit_rate'):
         source = int(fmt['bit_rate']) - 160_000  # minus a typical audio track
-    factor = 3 if video.get('codec_name') == 'av1' else 1.5
-    target = source * factor if source > 0 else pixel_rate * 0.06
-    return int(min(max(target, pixel_rate * 0.03), pixel_rate * 0.06))
+    if source <= 0:
+        return int(high)
+    equivalent = source * _H264_EQUIVALENT.get(video.get('codec_name'), 1.0)
+    return int(min(max(equivalent * spec['scale'], low), high))
 
 
-class CompatibleVideoPostProcessor(FFmpegPostProcessor):
+def _rate_options(rate):
+    return ['-b:v', str(rate), '-maxrate', str(rate * 3 // 2),
+            '-bufsize', str(rate * 2)]
+
+
+def _encoder_works(name, opts):
+    if name not in _encoder_ok:
+        # A tiny encode of a synthetic clip; fails fast if the GPU or
+        # driver behind a hardware encoder (or the encoder itself) is missing
+        cmd = [_ffmpeg_tools().executable, '-hide_banner', '-loglevel', 'error',
+               '-f', 'lavfi', '-i', 'testsrc2=size=1280x720:rate=30:duration=0.2',
+               *opts, *_rate_options(1_000_000), '-pix_fmt', 'yuv420p',
+               '-f', 'null', '-']
+        try:
+            _, _, returncode = Popen.run(cmd, text=True, stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, timeout=60)
+            _encoder_ok[name] = returncode == 0
+        except Exception:
+            _encoder_ok[name] = False
+        logger.info('Encoder %s available: %s', name, _encoder_ok[name])
+    return _encoder_ok[name]
+
+
+def _run_ffmpeg(args, duration, progress):
+    """Run ffmpeg, reporting progress (0-1) from its -progress output.
+    Raises ConversionError with ffmpeg's last error line on failure."""
+    cmd = [_ffmpeg_tools().executable, '-hide_banner', '-nostdin', '-y',
+           '-loglevel', 'error', '-progress', 'pipe:1', '-nostats', *args]
+    with tempfile.TemporaryFile() as errors:
+        proc = Popen(cmd, stdout=subprocess.PIPE, stderr=errors, text=True)
+        for line in proc.stdout:
+            key, _, value = line.strip().partition('=')
+            if key == 'out_time_us' and value.isdigit() and duration:
+                progress(min(int(value) / 1e6 / duration, 1.0))
+        returncode = proc.wait()
+        if returncode:
+            errors.seek(0)
+            lines = errors.read().decode('utf-8', 'replace').strip().splitlines()
+            raise ConversionError(lines[-1] if lines else
+                                  f'ffmpeg exited with code {returncode}')
+
+
+def convert_media(path, out_path, target='h264', progress=None, announce=None):
+    """Write the video at path, converted to a CONVERT_TARGETS format, to
+    out_path.
+
+    Streams already in the target codec (and AAC audio) are copied, not
+    re-encoded. Returns the encoder used ('copy' when only the container
+    or audio changed), or None - writing nothing - when the file already
+    is in the target format. announce(description) is called before any
+    work starts. Raises NotAVideoError for files without a video stream
+    and ConversionError when every encoder fails.
+    """
+    spec = CONVERT_TARGETS[target]
+    progress = progress or (lambda fraction: None)
+    try:
+        metadata = _ffmpeg_tools().get_metadata_object(path)
+    except Exception as e:
+        raise NotAVideoError(f'not a readable media file ({e})') from e
+    streams = metadata.get('streams') or []
+    video = next((st for st in streams if st.get('codec_type') == 'video'
+                  and not (st.get('disposition') or {}).get('attached_pic')), None)
+    audio = next((st for st in streams if st.get('codec_type') == 'audio'), None)
+    if video is None:
+        raise NotAVideoError('no video stream')
+    convert_video = video.get('codec_name') != spec['codec']
+    convert_audio = audio is not None and audio.get('codec_name') != 'aac'
+    same_container = (os.path.splitext(path)[1].lower()
+                      == os.path.splitext(out_path)[1].lower())
+    if not (convert_video or convert_audio) and same_container:
+        return None
+
+    changes = [f"{video.get('codec_name')} video"] if convert_video else []
+    if convert_audio:
+        changes.append(f"{audio.get('codec_name')} audio")
+    if announce:
+        announce(' and '.join(changes) or 'container')
+    try:
+        duration = float((metadata.get('format') or {}).get('duration') or 0)
+    except ValueError:
+        duration = 0
+    audio_opts = ['-c:a', 'aac', '-b:a', '192k'] if convert_audio else ['-c:a', 'copy']
+    common = ['-i', path, '-map', '0:v:0', '-map', '0:a:0?', '-map_metadata', '0',
+              *audio_opts, '-movflags', '+faststart']
+    if convert_video:
+        rate = _rate_options(conversion_bitrate(
+            video, metadata.get('format') or {}, target))
+        encoders = [(name, [*opts, *rate, '-pix_fmt', 'yuv420p'], opts)
+                    for name, opts in spec['encoders']]
+    else:
+        encoders = [('copy', ['-c:v', 'copy'], None)]
+    # Written under a temporary name and renamed when complete, so an
+    # interrupted conversion never leaves a broken file under the real name
+    work_path = prepend_extension(out_path, 'converting')
+    error = ConversionError(f"no working {spec['name']} encoder found")
+    for name, video_opts, probe_opts in encoders:
+        # Probed only when reached, so the first working encoder ends it
+        if probe_opts is not None and not _encoder_works(name, probe_opts):
+            continue
+        try:
+            _run_ffmpeg([*common, *video_opts, work_path], duration, progress)
+        except ConversionError as e:
+            # e.g. NVENC's 4096-pixel limit on 8K video: try the next one
+            error = e
+            logger.warning('Conversion of %s with %s failed: %s', path, name, e)
+            if os.path.exists(work_path):
+                os.remove(work_path)
+            continue
+        os.replace(work_path, out_path)
+        logger.info('Converted %s -> %s with %s', path, out_path, name)
+        return name
+    raise error
+
+
+def conversion_output_path(path, target):
+    """'<name> (H.264).mp4' / '<name> (AV1).mp4' next to the original."""
+    stem = os.path.splitext(path)[0]
+    return f"{stem} ({CONVERT_TARGETS[target]['name']}).mp4"
+
+
+VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.webm', '.mov', '.m4v', '.avi', '.wmv',
+                    '.flv', '.ts', '.3gp')
+# Names a folder scan leaves alone: Downstream's own conversion outputs,
+# conversions in progress, and yt-dlp's per-format pieces of a download
+# still being merged ('name.f137.mp4')
+_SKIP_IN_FOLDERS_RE = re.compile(
+    r' \((?:H\.264|AV1)\)$|\.(?:converting|compat|temp)$|\.f\d+$')
+
+
+def videos_in_folder(folder):
+    """Video files in folder and all its subfolders, in name order."""
+    found = []
+    for dirpath, dirnames, filenames in os.walk(folder):
+        dirnames.sort()
+        for name in sorted(filenames):
+            stem, ext = os.path.splitext(name)
+            if (ext.lower() in VIDEO_EXTENSIONS
+                    and not _SKIP_IN_FOLDERS_RE.search(stem)):
+                found.append(os.path.join(dirpath, name))
+    return found
+
+
+class CompatibleVideoPostProcessor(PostProcessor):
     """Converts a downloaded video to H.264 + AAC when it isn't already.
 
     Runs after merging and before the file moves to its final folder, so
-    later steps (transcripts) see the converted file. Streams that are
-    already compatible are copied, not re-encoded. Best-effort: on failure
-    the original file is kept and the status bar says so.
+    later steps (transcripts) see the converted file. Best-effort: on
+    failure the original file is kept and the status bar says so.
     """
 
     def __init__(self, status=None):
         super().__init__(None)
         self._status = status or (lambda message: None)
 
-    def _encoder_works(self, name, opts):
-        if name not in _h264_encoder_ok:
-            # A tiny encode of a synthetic clip; fails fast if the GPU or
-            # driver behind a hardware encoder is missing
-            cmd = [self.executable, '-hide_banner', '-loglevel', 'error',
-                   '-f', 'lavfi', '-i', 'testsrc2=size=1280x720:rate=30:duration=0.2',
-                   *opts, '-pix_fmt', 'yuv420p', '-f', 'null', '-']
-            try:
-                _, _, returncode = Popen.run(cmd, text=True, stdout=subprocess.PIPE,
-                                             stderr=subprocess.PIPE, timeout=30)
-                _h264_encoder_ok[name] = returncode == 0
-            except Exception:
-                _h264_encoder_ok[name] = False
-            logger.info('H.264 encoder %s available: %s', name, _h264_encoder_ok[name])
-        return _h264_encoder_ok[name]
-
     def run(self, info):
         path = info.get('filepath')
         if (not path or not os.path.exists(path)
                 or os.path.splitext(path)[1].lower() not in ('.mp4', '.mkv', '.mov')):
             return [], info  # audio-only downloads, or a WebM container
-        metadata = self.get_metadata_object(path)
-        streams = metadata.get('streams', [])
-        video = next((st for st in streams if st.get('codec_type') == 'video'
-                      and not (st.get('disposition') or {}).get('attached_pic')), None)
-        audio = next((st for st in streams if st.get('codec_type') == 'audio'), None)
-        if video is None:
-            return [], info
-        convert_video = video.get('codec_name') != 'h264'
-        convert_audio = audio is not None and audio.get('codec_name') != 'aac'
-        if not (convert_video or convert_audio):
-            return [], info
-
-        what = (f"{video.get('codec_name')} video" if convert_video else '') + (
-            ' and ' if convert_video and convert_audio else '') + (
-            f"{audio.get('codec_name')} audio" if convert_audio else '')
-        self.to_screen(f'Converting {what} to H.264/AAC for compatibility')
-        self._status('Converting video to H.264 for compatibility...')
-        audio_opts = (['-c:a', 'aac', '-b:a', '192k'] if convert_audio
-                      else ['-c:a', 'copy'])
-        common = ['-map', '0:v:0', '-map', '0:a:0?', '-map_metadata', '0',
-                  *audio_opts, '-movflags', '+faststart']
         out_path = prepend_extension(path, 'compat')
-        rate = h264_target_bitrate(video, metadata.get('format') or {})
-        rate_opts = ['-b:v', str(rate), '-maxrate', str(rate * 3 // 2),
-                     '-bufsize', str(rate * 2)]
-        encoders = ([(n, o + rate_opts) for n, o in _H264_ENCODERS]
-                    if convert_video else [('copy', ['-c:v', 'copy'])])
-        error = None
-        for name, video_opts in encoders:
-            if convert_video and not self._encoder_works(
-                    name, dict(_H264_ENCODERS)[name]):
-                continue
-            pix = ['-pix_fmt', 'yuv420p'] if convert_video else []
-            try:
-                self.run_ffmpeg(path, out_path, [*common, *video_opts, *pix])
-            except Exception as e:
-                # e.g. NVENC's 4096-pixel limit on 8K video: next encoder
-                error = e
-                logger.warning('H.264 conversion with %s failed: %s', name, e)
-                if os.path.exists(out_path):
-                    os.remove(out_path)
-                continue
-            os.replace(out_path, path)
-            logger.info('Converted %s with %s', path, name)
-            return [], info
-        self._status(f'Download complete - conversion to H.264 failed: {error}')
+        shown = [-1]
+
+        def progress(fraction):
+            percent = int(fraction * 100)
+            if percent != shown[0]:
+                shown[0] = percent
+                self._status('Converting video to H.264 for compatibility... '
+                             f'{percent}%')
+
+        def announce(what):
+            self.to_screen(f'Converting {what} to H.264/AAC for compatibility')
+            self._status('Converting video to H.264 for compatibility...')
+
+        try:
+            if convert_media(path, out_path, 'h264', progress, announce):
+                os.replace(out_path, path)
+        except NotAVideoError:
+            pass
+        except ConversionError as e:
+            self._status(f'Download complete - conversion to H.264 failed: {e}')
         return [], info
 
 
@@ -1154,6 +1318,12 @@ class DownstreamApp:
             self.main_frame = ttk.Frame(self.root, padding="10")
             self.main_frame.pack(fill=tk.BOTH, expand=True)
 
+            # Convert Files... queue (see queue_conversions)
+            self._convert_lock = threading.Lock()
+            self._convert_queue = []
+            self._convert_total = 0
+            self._convert_running = False
+
             # Create and pack all GUI elements
             self.create_url_frame()
             self.create_download_options()
@@ -1190,6 +1360,8 @@ class DownstreamApp:
     SYSMENU_SETTINGS_ID = 0x1000
     SYSMENU_HISTORY_ID = 0x1010
     SYSMENU_OPENFOLDER_ID = 0x1020
+    SYSMENU_CONVERT_ID = 0x1030
+    SYSMENU_CONVERT_FOLDER_ID = 0x1040
 
     def add_settings_to_system_menu(self):
         """Append Settings... and Download History... to the native
@@ -1231,6 +1403,10 @@ class DownstreamApp:
                 self.SYSMENU_HISTORY_ID: ("Download History...", self.show_history),
                 self.SYSMENU_OPENFOLDER_ID: ("Open Download Folder",
                                              self.open_download_folder),
+                self.SYSMENU_CONVERT_ID: ("Convert Files...",
+                                          self.choose_files_to_convert),
+                self.SYSMENU_CONVERT_FOLDER_ID: ("Convert Folder...",
+                                                 self.choose_folder_to_convert),
             }
             sysmenu = user32.GetSystemMenu(hwnd, False)
             user32.AppendMenuW(sysmenu, MF_SEPARATOR, 0, None)
@@ -1285,6 +1461,10 @@ class DownstreamApp:
         app_menu.add_command(label="Download History...", command=self.show_history)
         app_menu.add_command(label="Open Download Folder",
                              command=self.open_download_folder)
+        app_menu.add_command(label="Convert Files...",
+                             command=self.choose_files_to_convert)
+        app_menu.add_command(label="Convert Folder...",
+                             command=self.choose_folder_to_convert)
         menubar.add_cascade(label="Menu", menu=app_menu)
         self.root.config(menu=menubar)
 
@@ -1452,9 +1632,15 @@ class DownstreamApp:
                                           maximum=100, mode='determinate')
         self.progress_bar.pack(fill=tk.X)
 
+        status_row = ttk.Frame(progress_frame)
+        status_row.pack(fill=tk.X, pady=(2, 0))
         self.status_var = tk.StringVar(value="Ready")
-        self.status_label = ttk.Label(progress_frame, textvariable=self.status_var)
-        self.status_label.pack(anchor=tk.W, pady=(2, 0))
+        self.status_label = ttk.Label(status_row, textvariable=self.status_var)
+        self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(status_row, text="Convert Folder...", width=16,
+                   command=self.choose_folder_to_convert).pack(side=tk.RIGHT)
+        ttk.Button(status_row, text="Convert Files...", width=15,
+                   command=self.choose_files_to_convert).pack(side=tk.RIGHT, padx=(0, 4))
 
     def _warn_if_port_conflict(self):
         """Tell the user when the extension API port couldn't be bound.
@@ -1793,7 +1979,8 @@ class DownstreamApp:
 
     def save_settings(self, source_var, dest_var, type_var, format_var,
                       cookies_var, auto_var, quality_var, crosspost_var,
-                      md_var, srt_var, codec_var, settings_window):
+                      md_var, srt_var, codec_var, convert_var,
+                      convert_auto_var, settings_window):
         source = source_var.get().strip()
         dest = dest_var.get().strip()
         if not os.path.isdir(dest):
@@ -1816,6 +2003,10 @@ class DownstreamApp:
         self.settings["video_codec"] = next(
             (key for key, (label, _) in VIDEO_CODECS.items()
              if label == codec_var.get()), DEFAULT_SETTINGS["video_codec"])
+        self.settings["convert_target"] = next(
+            (key for key, spec in CONVERT_TARGETS.items()
+             if spec['label'] == convert_var.get()), DEFAULT_SETTINGS["convert_target"])
+        self.settings["convert_without_asking"] = bool(convert_auto_var.get())
         self.save_settings_file()
         # Apply the new default to the main window immediately
         self.download_type.set(type_var.get())
@@ -1890,6 +2081,25 @@ class DownstreamApp:
                      values=codec_labels,
                      width=max(len(l) for l in codec_labels)).pack(side=tk.LEFT, padx=5)
 
+        # Convert Files...: target format, and whether to ask each time
+        convert_frame = ttk.Frame(settings_frame)
+        convert_frame.pack(fill=tk.X, pady=3)
+        ttk.Label(convert_frame, text="Convert files to:", width=22).pack(side=tk.LEFT)
+        target_labels = [t['label'] for t in CONVERT_TARGETS.values()]
+        convert_var = tk.StringVar(value=CONVERT_TARGETS.get(
+            self.settings.get("convert_target"), CONVERT_TARGETS["h264"])['label'])
+        ttk.Combobox(convert_frame, textvariable=convert_var, state="readonly",
+                     values=target_labels,
+                     width=max(len(l) for l in target_labels)).pack(side=tk.LEFT, padx=5)
+        convert_auto_frame = ttk.Frame(settings_frame)
+        convert_auto_frame.pack(fill=tk.X, pady=(0, 3))
+        ttk.Label(convert_auto_frame, text="", width=22).pack(side=tk.LEFT)
+        convert_auto_var = tk.BooleanVar(
+            value=bool(self.settings.get("convert_without_asking", True)))
+        ttk.Checkbutton(convert_auto_frame,
+                        text="convert right away, without asking",
+                        variable=convert_auto_var).pack(side=tk.LEFT, padx=5)
+
         # Instagram/Threads mostly require a login; picking a browser here
         # lets yt-dlp reuse that browser's session cookies
         cookies_frame = ttk.Frame(settings_frame)
@@ -1954,6 +2164,7 @@ class DownstreamApp:
                                                       auto_var, quality_var,
                                                       crosspost_var,
                                                       md_var, srt_var, codec_var,
+                                                      convert_var, convert_auto_var,
                                                       settings_window)).pack()
 
         # Size the window to its content rather than a fixed pixel geometry,
@@ -1962,6 +2173,164 @@ class DownstreamApp:
         settings_window.update_idletasks()
         settings_window.minsize(max(560, settings_window.winfo_reqwidth()),
                                 settings_window.winfo_reqheight())
+
+    VIDEO_FILE_TYPES = [
+        ("Video files", "*.mp4 *.mkv *.webm *.mov *.m4v *.avi *.wmv *.flv *.ts *.3gp"),
+        ("All files", "*.*"),
+    ]
+
+    def choose_files_to_convert(self):
+        paths = filedialog.askopenfilenames(
+            parent=self.root, title="Choose videos to convert",
+            initialdir=self.settings.get("download_path"),
+            filetypes=self.VIDEO_FILE_TYPES)
+        if paths:
+            self.open_files_for_conversion(list(paths))
+
+    def choose_folder_to_convert(self):
+        folder = filedialog.askdirectory(
+            parent=self.root, title="Choose a folder of videos to convert",
+            initialdir=self.settings.get("download_path"), mustexist=True)
+        if folder:
+            self.open_files_for_conversion([os.path.normpath(folder)])
+
+    def open_files_for_conversion(self, paths):
+        """Convert files and folders picked in Convert Files/Folder...,
+        dropped on the exe, or opened with Downstream - to the format chosen
+        in Settings, or one picked now if Settings says to ask. Folders
+        include their subfolders."""
+        folders = [path for path in paths if os.path.isdir(path)]
+        files = [path for path in paths if not os.path.isdir(path)]
+        for folder in folders:
+            files += videos_in_folder(folder)
+        files = list(dict.fromkeys(files))
+        where = (f'"{os.path.basename(folders[0]) or folders[0]}"'
+                 if len(folders) == 1 else f"{len(folders)} folders")
+        if not files:
+            messagebox.showinfo("Convert Folder",
+                                f"No videos found in {where} or its subfolders.")
+            return
+        count = f"{len(files)} video{'s' if len(files) != 1 else ''}"
+        what = f"{count} in {where} (including subfolders)" if folders else count
+        target = self.settings.get("convert_target", "h264")
+        if not self.settings.get("convert_without_asking", True):
+            target = self.ask_convert_target(what, target)
+            if target is None:
+                return
+        elif folders and not messagebox.askyesno(
+                "Convert Folder",
+                f"Convert {what} to {CONVERT_TARGETS[target]['name']}?\n\n"
+                "Each converted copy is saved next to its original; videos "
+                "that already have one are skipped."):
+            # Folders always get a look at the count before starting, so a
+            # mis-picked folder can't queue hundreds of conversions
+            return
+        self.queue_conversions(files, target)
+
+    def ask_convert_target(self, what, default):
+        """Small dialog asking for the target format; None if cancelled."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Convert Files")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text=f"Convert {what} to:").pack(anchor=tk.W)
+        labels = [spec['label'] for spec in CONVERT_TARGETS.values()]
+        choice = tk.StringVar(value=CONVERT_TARGETS[default]['label'])
+        ttk.Combobox(frame, textvariable=choice, values=labels, state="readonly",
+                     width=max(len(l) for l in labels)).pack(fill=tk.X, pady=8)
+        result = []
+        buttons = ttk.Frame(frame)
+        buttons.pack(anchor=tk.E)
+
+        def accept():
+            result.append(next(key for key, spec in CONVERT_TARGETS.items()
+                               if spec['label'] == choice.get()))
+            dialog.destroy()
+        ttk.Button(buttons, text="Convert", command=accept).pack(side=tk.LEFT, padx=4)
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT)
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+        return result[0] if result else None
+
+    def queue_conversions(self, paths, target):
+        """Convert files one at a time on a worker thread; more files can be
+        added while it runs."""
+        with self._convert_lock:
+            self._convert_queue.extend((path, target) for path in paths)
+            self._convert_total += len(paths)
+            if self._convert_running:
+                return
+            self._convert_running = True
+        threading.Thread(target=self._conversion_worker, daemon=True).start()
+
+    def _conversion_worker(self):
+        converted, skipped, failed = [], [], []
+        number = 0
+        while True:
+            with self._convert_lock:
+                if not self._convert_queue:
+                    self._convert_running = False
+                    total, self._convert_total = self._convert_total, 0
+                    break
+                path, target = self._convert_queue.pop(0)
+                number += 1
+                total = self._convert_total
+            name = os.path.basename(path)
+            label = CONVERT_TARGETS[target]['name']
+            prefix = f"Converting {number} of {total}: {name}" if total > 1 \
+                else f"Converting {name}"
+            self.root.after(0, self.status_var.set, f"{prefix} to {label}...")
+            shown = [-1]
+
+            def progress(fraction, prefix=prefix, label=label):
+                percent = int(fraction * 100)
+                if percent != shown[0]:
+                    shown[0] = percent
+                    self.root.after(0, self.progress_var.set, percent)
+                    self.root.after(0, self.status_var.set,
+                                    f"{prefix} to {label}... {percent}%")
+
+            out_path = conversion_output_path(path, target)
+            if os.path.exists(out_path):
+                skipped.append(f"{name}: already converted "
+                               f"({os.path.basename(out_path)})")
+                continue
+            try:
+                if convert_media(path, out_path, target, progress) is None:
+                    skipped.append(f"{name}: already {label}")
+                else:
+                    converted.append(out_path)
+                    self.log_download(path, f"convert:{target}", "Success")
+            except NotAVideoError as e:
+                skipped.append(f"{name}: {e}")
+            except Exception as e:
+                logger.error("Conversion failed for %s", path, exc_info=True)
+                failed.append(f"{name}: {e}")
+                self.log_download(path, f"convert:{target}", f"Failed: {e}")
+            self.root.after(0, self.progress_var.set, 0)
+
+        parts = []
+        if converted:
+            parts.append(f"converted {len(converted)}")
+        if skipped:
+            parts.append(f"skipped {len(skipped)}")
+        if failed:
+            parts.append(f"failed {len(failed)}")
+        summary = "Conversion done: " + ", ".join(parts) if parts else "Ready"
+        self.root.after(0, self.status_var.set, summary)
+        if converted:
+            self.root.after(0, self.flash_status)
+        if skipped or failed:
+            details = "\n".join(failed + skipped)
+            show = messagebox.showerror if failed else messagebox.showinfo
+            self.root.after(0, lambda: show("Convert Files", f"{summary}\n\n{details}"))
+
+    def bring_to_front(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
 
     def open_download_folder(self):
         """Show the destination folder in the file manager."""
@@ -2028,6 +2397,43 @@ def index():
         'status': 'running',
         'message': 'Downstream API is active'
     })
+
+# The running app's window, so a second launch can hand it files to convert
+_gui_app = None
+
+
+@flask_app.route('/api/convert', methods=['POST'])
+def api_convert():
+    """Files or folders a second copy of Downstream was opened with (Open
+    with, or dropped on the exe): convert them in this, the running, copy.
+
+    Browsers send an Origin header with every cross-site POST, so refusing
+    requests that carry one keeps web pages from starting conversions.
+    """
+    if request.headers.get('Origin'):
+        return jsonify({'success': False, 'error': 'Forbidden'}), 403
+    data = request.get_json(silent=True) or {}
+    paths = [path for path in data.get('paths') or []
+             if isinstance(path, str) and os.path.exists(path)]
+    if not paths or _gui_app is None:
+        return jsonify({'success': False, 'error': 'No files to convert'}), 400
+    _gui_app.root.after(0, _gui_app.bring_to_front)
+    _gui_app.root.after(0, _gui_app.open_files_for_conversion, paths)
+    return jsonify({'success': True})
+
+
+def forward_to_running_app(paths):
+    """Hand files to an already-running Downstream; False if none answers."""
+    request_ = urllib.request.Request(
+        f'http://127.0.0.1:{API_PORT}/api/convert',
+        data=json.dumps({'paths': paths}).encode('utf-8'),
+        headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(request_, timeout=5) as response:
+            return json.load(response).get('success') is True
+    except Exception:
+        return False
+
 
 @flask_app.route('/api/download', methods=['POST'])
 def api_download():
@@ -2117,7 +2523,16 @@ def run_flask():
             exc_info=True)
 
 def main():
+    global _gui_app
     logger.info("Starting Downstream application")
+    # Files and folders passed on the command line (Open with, or dropped on
+    # the exe or its shortcut) are converted. If Downstream is already running it
+    # converts them, and this copy exits without opening a window.
+    open_paths = [os.path.abspath(arg) for arg in sys.argv[1:]
+                  if os.path.exists(arg)]
+    if open_paths and forward_to_running_app(open_paths):
+        logger.info("Handed %d file(s) to the running Downstream", len(open_paths))
+        return
     if os.name == 'nt':
         # Give the process its own taskbar identity; otherwise Windows groups
         # the window under pythonw.exe and shows the Python/Tk icon instead
@@ -2169,6 +2584,9 @@ def main():
             sys.exit(1)
 
         app = DownstreamApp(root)
+        _gui_app = app
+        if open_paths:
+            root.after(500, app.open_files_for_conversion, open_paths)
         logger.debug("Created DownstreamApp instance")
         logger.info("Starting main event loop")
         root.mainloop()
