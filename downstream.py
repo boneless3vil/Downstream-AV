@@ -3,10 +3,13 @@ import tkinter.font as tkfont
 from tkinter import ttk, messagebox, filedialog
 import yt_dlp
 from yt_dlp.postprocessor.common import PostProcessor
+from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
+from yt_dlp.utils import Popen, prepend_extension
 import os
 import json
 import re
 import shutil
+import subprocess
 import threading
 import sys
 import logging
@@ -35,7 +38,7 @@ for _noisy in ('httpx', 'httpcore', 'huggingface_hub', 'faster_whisper'):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 APP_NAME = "Downstream"
-APP_VERSION = "1.6.15"
+APP_VERSION = "1.6.16"
 
 def get_base_path():
     """Get base path for resources, works both in development and when packaged"""
@@ -98,6 +101,10 @@ DEFAULT_SETTINGS = {
     # download gets its own subfolder (several files arrive per video).
     "transcript_md": False,
     "transcript_srt": False,
+    # Video codec to save (see VIDEO_CODECS). YouTube's top-ranked streams
+    # are AV1/VP9 video with Opus audio, which many Windows apps can't play
+    # and some upload sites reject; the default saves H.264 + AAC instead.
+    "video_codec": "h264",
 }
 
 # Quality presets for auto download and the extension API: a yt-dlp format
@@ -126,6 +133,35 @@ QUALITY_FORMATS = {
         "low": ("bestaudio/best", ["abr~64"]),
     },
 }
+
+# Settings > Video format choices: key -> (label, extra format_sort). The
+# extra fields come after the resolution cap and frame rate, so a codec
+# preference never costs resolution; sites without that codec fall back to
+# their best stream. Only 'h264' converts (CompatibleVideoPostProcessor).
+VIDEO_CODECS = {
+    # 'hdr:sdr' ranks SDR above HDR without excluding HDR-only videos: HDR
+    # can't become plain H.264 without washed-out colors, and YouTube keeps
+    # an SDR version of every HDR upload
+    'h264': ('H.264 - plays and uploads everywhere',
+             ['fps', 'hdr:sdr', 'vcodec:h264', 'acodec:aac']),
+    'av1': ('AV1 - smallest files',
+            ['fps', 'vcodec:av01', 'acodec:aac']),
+    'vp9': ("VP9 - YouTube's original stream",
+            ['fps', 'vcodec:vp9']),
+    'best': ('Best available - no preference, no conversion', []),
+}
+
+
+def quality_format(download_type, quality, settings):
+    """(format expression, format_sort) for a preset, honoring the
+    video_codec setting. Raises KeyError for an unknown type."""
+    type_presets = QUALITY_FORMATS[download_type]
+    format_expr, format_sort = type_presets.get(quality, type_presets['best'])
+    codec = settings.get('video_codec') or DEFAULT_SETTINGS['video_codec']
+    extra = VIDEO_CODECS.get(codec, VIDEO_CODECS['h264'])[1]
+    if extra and download_type != 'audio-only':
+        format_sort = (format_sort or ['res']) + extra
+    return format_expr, format_sort
 
 
 def get_config_dir():
@@ -188,6 +224,8 @@ def load_settings(base_path):
         if settings.get("auto_download_quality") not in ("best", "medium", "low"):
             settings["auto_download_quality"] = DEFAULT_SETTINGS["auto_download_quality"]
         settings["confirm_crosspost"] = bool(settings.get("confirm_crosspost"))
+        if settings.get("video_codec") not in VIDEO_CODECS:
+            settings["video_codec"] = DEFAULT_SETTINGS["video_codec"]
         settings["transcript_md"] = bool(settings.get("transcript_md"))
         settings["transcript_srt"] = bool(settings.get("transcript_srt"))
     except Exception:
@@ -748,24 +786,158 @@ class TranscriptPostProcessor(PostProcessor):
         return wrote_any
 
 
+# H.264 encoders to try for conversions, best first: GPU encoders are many
+# times faster than libx264 for 4K. Each is probed once (an ffmpeg build
+# lists NVENC/QSV/AMF whether or not the hardware is present).
+_H264_ENCODERS = [
+    ('h264_nvenc', ['-c:v', 'h264_nvenc', '-preset', 'p5', '-tune', 'hq',
+                    '-rc', 'vbr']),
+    ('h264_qsv', ['-c:v', 'h264_qsv', '-preset', 'slow']),
+    ('h264_amf', ['-c:v', 'h264_amf', '-quality', 'quality', '-rc', 'vbr_peak']),
+    ('libx264', ['-c:v', 'libx264', '-preset', 'fast']),
+]
+_h264_encoder_ok = {}
+
+
+def h264_target_bitrate(video, fmt):
+    """Bitrate (bits/s) for converting a video stream to H.264.
+
+    Sized for social-media posting, where the site re-encodes anyway:
+    - a multiple of the source bitrate: 3x for AV1 (H.264 needs about 2-3x
+      AV1's bitrate; measured on a 1080p AV1 download, VMAF 95 -
+      indistinguishable - at 2.7x the source size), 1.5x for VP9/HEVC
+      (YouTube's VP9 runs ~5x AV1's bitrate for the same video)
+    - capped at 0.06 bits per pixel per frame: ~3.7 Mbps for a 1080p30
+      Short, ~8.4 Mbps for 4K24 (a hand-made Facebook upload of the same
+      4K video used 8.3 Mbps; H.264 at 8 Mbps measured near-lossless
+      against YouTube's 10 Mbps VP9)
+    - at least 0.03 bits per pixel per frame for very lean sources
+    """
+    width = int(video.get('width') or 1920)
+    height = int(video.get('height') or 1080)
+    try:
+        num, den = (video.get('avg_frame_rate') or '30/1').split('/')
+        fps = float(num) / float(den)
+    except (ValueError, ZeroDivisionError):
+        fps = 0
+    pixel_rate = width * height * (fps or 30)
+    source = int(video.get('bit_rate') or 0)
+    if not source and fmt.get('bit_rate'):
+        source = int(fmt['bit_rate']) - 160_000  # minus a typical audio track
+    factor = 3 if video.get('codec_name') == 'av1' else 1.5
+    target = source * factor if source > 0 else pixel_rate * 0.06
+    return int(min(max(target, pixel_rate * 0.03), pixel_rate * 0.06))
+
+
+class CompatibleVideoPostProcessor(FFmpegPostProcessor):
+    """Converts a downloaded video to H.264 + AAC when it isn't already.
+
+    Runs after merging and before the file moves to its final folder, so
+    later steps (transcripts) see the converted file. Streams that are
+    already compatible are copied, not re-encoded. Best-effort: on failure
+    the original file is kept and the status bar says so.
+    """
+
+    def __init__(self, status=None):
+        super().__init__(None)
+        self._status = status or (lambda message: None)
+
+    def _encoder_works(self, name, opts):
+        if name not in _h264_encoder_ok:
+            # A tiny encode of a synthetic clip; fails fast if the GPU or
+            # driver behind a hardware encoder is missing
+            cmd = [self.executable, '-hide_banner', '-loglevel', 'error',
+                   '-f', 'lavfi', '-i', 'testsrc2=size=1280x720:rate=30:duration=0.2',
+                   *opts, '-pix_fmt', 'yuv420p', '-f', 'null', '-']
+            try:
+                _, _, returncode = Popen.run(cmd, text=True, stdout=subprocess.PIPE,
+                                             stderr=subprocess.PIPE, timeout=30)
+                _h264_encoder_ok[name] = returncode == 0
+            except Exception:
+                _h264_encoder_ok[name] = False
+            logger.info('H.264 encoder %s available: %s', name, _h264_encoder_ok[name])
+        return _h264_encoder_ok[name]
+
+    def run(self, info):
+        path = info.get('filepath')
+        if (not path or not os.path.exists(path)
+                or os.path.splitext(path)[1].lower() not in ('.mp4', '.mkv', '.mov')):
+            return [], info  # audio-only downloads, or a WebM container
+        metadata = self.get_metadata_object(path)
+        streams = metadata.get('streams', [])
+        video = next((st for st in streams if st.get('codec_type') == 'video'
+                      and not (st.get('disposition') or {}).get('attached_pic')), None)
+        audio = next((st for st in streams if st.get('codec_type') == 'audio'), None)
+        if video is None:
+            return [], info
+        convert_video = video.get('codec_name') != 'h264'
+        convert_audio = audio is not None and audio.get('codec_name') != 'aac'
+        if not (convert_video or convert_audio):
+            return [], info
+
+        what = (f"{video.get('codec_name')} video" if convert_video else '') + (
+            ' and ' if convert_video and convert_audio else '') + (
+            f"{audio.get('codec_name')} audio" if convert_audio else '')
+        self.to_screen(f'Converting {what} to H.264/AAC for compatibility')
+        self._status('Converting video to H.264 for compatibility...')
+        audio_opts = (['-c:a', 'aac', '-b:a', '192k'] if convert_audio
+                      else ['-c:a', 'copy'])
+        common = ['-map', '0:v:0', '-map', '0:a:0?', '-map_metadata', '0',
+                  *audio_opts, '-movflags', '+faststart']
+        out_path = prepend_extension(path, 'compat')
+        rate = h264_target_bitrate(video, metadata.get('format') or {})
+        rate_opts = ['-b:v', str(rate), '-maxrate', str(rate * 3 // 2),
+                     '-bufsize', str(rate * 2)]
+        encoders = ([(n, o + rate_opts) for n, o in _H264_ENCODERS]
+                    if convert_video else [('copy', ['-c:v', 'copy'])])
+        error = None
+        for name, video_opts in encoders:
+            if convert_video and not self._encoder_works(
+                    name, dict(_H264_ENCODERS)[name]):
+                continue
+            pix = ['-pix_fmt', 'yuv420p'] if convert_video else []
+            try:
+                self.run_ffmpeg(path, out_path, [*common, *video_opts, *pix])
+            except Exception as e:
+                # e.g. NVENC's 4096-pixel limit on 8K video: next encoder
+                error = e
+                logger.warning('H.264 conversion with %s failed: %s', name, e)
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+                continue
+            os.replace(out_path, path)
+            logger.info('Converted %s with %s', path, name)
+            return [], info
+        self._status(f'Download complete - conversion to H.264 failed: {error}')
+        return [], info
+
+
 def transcript_post_processors(settings, status=None):
-    """Post-processors run_with_cookie_fallback should attach ([] when off).
+    """Transcript post-processors as (pp, when) pairs ([] when off).
 
     status, if given, is called with short progress messages for the UI.
     """
     if not transcript_enabled(settings):
         return []
-    return [TranscriptPostProcessor(bool(settings.get('transcript_md')),
-                                    bool(settings.get('transcript_srt')),
-                                    status)]
+    return [(TranscriptPostProcessor(bool(settings.get('transcript_md')),
+                                     bool(settings.get('transcript_srt')),
+                                     status), 'after_move')]
 
 
-def run_download_with_transcripts(ydl_opts, settings, do_download, status=None):
-    """Download with transcript handling attached. Transcripts are
-    best-effort: if fetching the site's subtitles sinks the download (rate
-    limits and the like), retry once without them - the video still
-    arrives and its audio is transcribed instead."""
-    post_processors = transcript_post_processors(settings, status)
+def download_post_processors(settings, status=None):
+    """Every post-processor Settings asks for, as (pp, when) pairs."""
+    pps = []
+    if settings.get('video_codec', 'h264') == 'h264':
+        pps.append((CompatibleVideoPostProcessor(status), 'post_process'))
+    return pps + transcript_post_processors(settings, status)
+
+
+def run_download(ydl_opts, settings, do_download, status=None):
+    """Download with the post-processors Settings asks for attached.
+    Transcripts are best-effort: if fetching the site's subtitles sinks the
+    download (rate limits and the like), retry once without them - the
+    video still arrives and its audio is transcribed instead."""
+    post_processors = download_post_processors(settings, status)
     try:
         return run_with_cookie_fallback(
             ydl_opts, do_download, post_processors=post_processors)
@@ -801,8 +973,8 @@ def run_with_cookie_fallback(ydl_opts, action, post_processors=()):
     """
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            for pp in post_processors:
-                ydl.add_post_processor(pp, when='after_move')
+            for pp, when in post_processors:
+                ydl.add_post_processor(pp, when=when)
             return action(ydl)
     except Exception as e:
         err = str(e).lower()
@@ -822,8 +994,8 @@ def run_with_cookie_fallback(ydl_opts, action, post_processors=()):
         opts = {k: v for k, v in ydl_opts.items() if k != 'cookiesfrombrowser'}
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                for pp in post_processors:
-                    ydl.add_post_processor(pp, when='after_move')
+                for pp, when in post_processors:
+                    ydl.add_post_processor(pp, when=when)
                 return action(ydl)
         except Exception as retry_error:
             raise Exception(
@@ -1531,9 +1703,8 @@ class DownstreamApp:
             ydl_opts['playlist_reverse'] = self.reverse_playlist.get()
 
         if auto_quality is not None:
-            type_presets = QUALITY_FORMATS[download_type]
-            format_expr, format_sort = type_presets.get(
-                auto_quality, type_presets['best'])
+            format_expr, format_sort = quality_format(
+                download_type, auto_quality, self.settings)
             ydl_opts['format'] = format_expr
             if format_sort:
                 ydl_opts['format_sort'] = format_sort
@@ -1575,7 +1746,7 @@ class DownstreamApp:
 
             try:
                 self.root.after(0, self.status_var.set, "Downloading..." + playlist_suffix)
-                error_code = run_download_with_transcripts(
+                error_code = run_download(
                     ydl_opts, self.settings, lambda ydl: ydl.download([url]),
                     status=report)
                 if error_code != 0:
@@ -1622,7 +1793,7 @@ class DownstreamApp:
 
     def save_settings(self, source_var, dest_var, type_var, format_var,
                       cookies_var, auto_var, quality_var, crosspost_var,
-                      md_var, srt_var, settings_window):
+                      md_var, srt_var, codec_var, settings_window):
         source = source_var.get().strip()
         dest = dest_var.get().strip()
         if not os.path.isdir(dest):
@@ -1642,6 +1813,9 @@ class DownstreamApp:
         self.settings["confirm_crosspost"] = bool(crosspost_var.get())
         self.settings["transcript_md"] = bool(md_var.get())
         self.settings["transcript_srt"] = bool(srt_var.get())
+        self.settings["video_codec"] = next(
+            (key for key, (label, _) in VIDEO_CODECS.items()
+             if label == codec_var.get()), DEFAULT_SETTINGS["video_codec"])
         self.save_settings_file()
         # Apply the new default to the main window immediately
         self.download_type.set(type_var.get())
@@ -1704,6 +1878,17 @@ class DownstreamApp:
         format_entry.pack(side=tk.LEFT, padx=5)
 
         self.add_context_menu(format_entry)
+
+        # Video format: which codec to save (VIDEO_CODECS)
+        codec_frame = ttk.Frame(settings_frame)
+        codec_frame.pack(fill=tk.X, pady=3)
+        ttk.Label(codec_frame, text="Video format:", width=22).pack(side=tk.LEFT)
+        codec_labels = [label for label, _ in VIDEO_CODECS.values()]
+        codec_var = tk.StringVar(value=VIDEO_CODECS.get(
+            self.settings.get("video_codec"), VIDEO_CODECS["h264"])[0])
+        ttk.Combobox(codec_frame, textvariable=codec_var, state="readonly",
+                     values=codec_labels,
+                     width=max(len(l) for l in codec_labels)).pack(side=tk.LEFT, padx=5)
 
         # Instagram/Threads mostly require a login; picking a browser here
         # lets yt-dlp reuse that browser's session cookies
@@ -1768,7 +1953,7 @@ class DownstreamApp:
                                                       format_var, cookies_var,
                                                       auto_var, quality_var,
                                                       crosspost_var,
-                                                      md_var, srt_var,
+                                                      md_var, srt_var, codec_var,
                                                       settings_window)).pack()
 
         # Size the window to its content rather than a fixed pixel geometry,
@@ -1867,18 +2052,17 @@ def api_download():
         quality = settings.get('quality', 'highest')
         quality = {'highest': 'best', 'lowest': 'low'}.get(quality, quality)
 
-        type_presets = QUALITY_FORMATS.get(download_type)
-        if type_presets is None:
+        if download_type not in QUALITY_FORMATS:
             return jsonify({
                 'success': False,
                 'error': f'Unknown download type: {download_type}'
             }), 400
-        selected_format, format_sort = type_presets.get(quality, type_presets['best'])
-        logger.info(f"Selected format expression: {selected_format} sort: {format_sort}")
-
-        # Honor the folders and merge format configured in the desktop
-        # app's Settings
+        # Honor the folders, merge format and compatibility choice
+        # configured in the desktop app's Settings
         app_settings = load_settings(get_base_path())
+        selected_format, format_sort = quality_format(
+            download_type, quality, app_settings)
+        logger.info(f"Selected format expression: {selected_format} sort: {format_sort}")
         ydl_opts = {
             **site_ydl_opts(video_url, app_settings),
             **transcript_ydl_opts(app_settings),
@@ -1894,7 +2078,7 @@ def api_download():
         # Start download in background thread
         def download_thread():
             try:
-                run_download_with_transcripts(
+                run_download(
                     ydl_opts, app_settings,
                     lambda ydl: ydl.download([video_url]))
                 logger.info("Download completed successfully")

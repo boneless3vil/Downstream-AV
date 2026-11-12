@@ -110,7 +110,16 @@ Then install ffmpeg (and ideally Deno) with your system's package manager.
    - Source folder for in-progress downloads (optional; finished files are moved to the destination)
    - Destination folder for finished downloads
    - Default download type (Video + Audio, Video Only, Audio Only)
-   - Default video format
+   - Default video format (the container, e.g. mp4)
+   - Video format: which video codec to save
+     - H.264 (default) - plays and uploads everywhere. Uses the site's own
+       H.264 + AAC streams when it has them at the chosen resolution (YouTube
+       up to 1080p); otherwise converts after downloading, on the GPU when
+       one is available, at a size suited to social-media posting (about
+       8 Mbps for 4K). Prefers standard over HDR versions.
+     - AV1 - smallest files; YouTube's AV1 stream with AAC audio, no conversion
+     - VP9 - YouTube's original VP9 stream (with Opus audio), untouched
+     - Best available - whatever the site ranks best, no conversion
    - Instagram/Threads login: pick the browser you're logged in with to
      reuse its cookies for posts that require a login
    - Auto download: skip the format picker entirely — pasting a URL starts
