@@ -112,11 +112,16 @@ Then install ffmpeg (and ideally Deno) with your system's package manager.
    - Default download type (Video + Audio, Video Only, Audio Only)
    - Default video format (the container, e.g. mp4)
    - Video format: which video codec to save
-     - H.264 (default) - plays and uploads everywhere. Uses the site's own
-       H.264 + AAC streams when it has them at the chosen resolution (YouTube
-       up to 1080p); otherwise converts after downloading, on the GPU when
-       one is available, at a size suited to social-media posting (about
-       8 Mbps for 4K). Prefers standard over HDR versions.
+     - H.264 (default) - plays and uploads everywhere. Files are made to meet
+       Meta's published upload spec for Facebook Reels (which all new
+       Facebook videos are posted as): H.264 4:2:0 at a fixed 24-60 fps with
+       a keyframe every 2 seconds, aspect ratio between 16:9 and 9:16 (wider
+       or taller videos get black bars), at least 540 px on the short side,
+       and AAC-LC 48 kHz stereo audio. Streams that already comply are
+       copied; anything else is fixed after downloading, on the GPU when
+       available, sized for social media (about 8 Mbps for 4K). Reels must
+       also be 3-90 seconds long - conversions list longer videos, which
+       need trimming or posting as a regular video.
      - AV1 - smallest files; YouTube's AV1 stream with AAC audio, no conversion
      - VP9 - YouTube's original VP9 stream (with Opus audio), untouched
      - Best available - whatever the site ranks best, no conversion

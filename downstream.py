@@ -40,7 +40,7 @@ for _noisy in ('httpx', 'httpcore', 'huggingface_hub', 'faster_whisper'):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 APP_NAME = "Downstream"
-APP_VERSION = "1.6.17"
+APP_VERSION = "1.6.18"
 
 def get_base_path():
     """Get base path for resources, works both in development and when packaged"""
@@ -809,6 +809,7 @@ CONVERT_TARGETS = {
     'h264': {
         'label': 'H.264 + AAC (.mp4) - plays and uploads everywhere',
         'name': 'H.264', 'codec': 'h264', 'scale': 1.0, 'bpp': (0.03, 0.06),
+        'upload_spec': True,
         'encoders': [
             ('h264_nvenc', ['-c:v', 'h264_nvenc', '-preset', 'p5',
                             '-tune', 'hq', '-rc', 'vbr']),
@@ -935,19 +936,152 @@ def _run_ffmpeg(args, duration, progress):
                                   f'ffmpeg exited with code {returncode}')
 
 
-def convert_media(path, out_path, target='h264', progress=None, announce=None):
-    """Write the video at path, converted to a CONVERT_TARGETS format, to
-    out_path.
+# Meta's published requirements for Facebook Reels - and Facebook now
+# publishes every new video as a Reel (Reels Publishing API guide,
+# developers.facebook.com): H.264, 4:2:0, progressive, fixed 24-60 fps,
+# closed GOP of 2-5 s, aspect ratio between 16:9 and 9:16, at least 540 px
+# on the short side; AAC Low Complexity, 48 kHz, stereo, 128 kbps+. The
+# H.264 target meets all of them. Reels must also be 3-90 s long, which no
+# conversion can fix; conversions point out longer videos instead.
+UPLOAD_SPEC = {
+    'fps': (24, 60),
+    'keyframe_every': 2.0,
+    'max_keyframe_gap': 5.0,
+    'aspect': (9 / 16, 16 / 9),
+    'min_side': 540,
+    'audio_rate': 48000,
+    'audio_min_bitrate': 128_000,
+    'reel_max_seconds': 90,
+}
 
-    Streams already in the target codec (and AAC audio) are copied, not
-    re-encoded. Returns the encoder used ('copy' when only the container
-    or audio changed), or None - writing nothing - when the file already
-    is in the target format. announce(description) is called before any
-    work starts. Raises NotAVideoError for files without a video stream
-    and ConversionError when every encoder fails.
-    """
+
+def _fps(rate):
+    try:
+        num, den = (rate or '0/1').split('/')
+        return float(num) / float(den)
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def _display_size(video):
+    """Width and height as shown, after any rotation flag (phone videos)."""
+    width, height = int(video.get('width') or 0), int(video.get('height') or 0)
+    rotation = next((sd.get('rotation') for sd in video.get('side_data_list') or []
+                     if 'rotation' in sd), 0)
+    try:
+        sideways = abs(int(rotation)) % 180 == 90
+    except (TypeError, ValueError):
+        sideways = False
+    return (height, width) if sideways else (width, height)
+
+
+def max_keyframe_gap(path, duration):
+    """Longest stretch in seconds without a keyframe in the first video
+    stream, read from packet flags (no decoding, so it's quick)."""
+    cmd = [_ffmpeg_tools().probe_executable, '-v', 'error', '-select_streams', 'v:0',
+           '-show_entries', 'packet=pts_time,flags', '-of', 'csv=p=0', path]
+    try:
+        stdout, _, _ = Popen.run(cmd, text=True, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, timeout=600)
+    except Exception:
+        return 0.0  # can't tell; don't force a re-encode over it
+    times = []
+    for line in stdout.splitlines():
+        pts, _, flags = line.strip().partition(',')
+        if 'K' in flags:
+            try:
+                times.append(float(pts))
+            except ValueError:
+                pass
+    if not times:
+        return duration
+    times.sort()
+    points = times + ([duration] if duration > times[-1] else [])
+    return max((b - a for a, b in zip(points, points[1:])), default=0.0)
+
+
+def _upload_problems(video, audio, duration, path):
+    """(video problems, audio problems): how the streams miss UPLOAD_SPEC."""
+    video_problems, audio_problems = [], []
+    if video.get('codec_name') != 'h264':
+        video_problems.append(f"{video.get('codec_name')} video")
+    if video.get('pix_fmt') != 'yuv420p':
+        video_problems.append(f"{video.get('pix_fmt')} pixels")
+    if (video.get('field_order') or 'progressive') not in ('progressive', 'unknown'):
+        video_problems.append('interlaced')
+    low_fps, high_fps = UPLOAD_SPEC['fps']
+    real, average = _fps(video.get('r_frame_rate')), _fps(video.get('avg_frame_rate'))
+    if average and not low_fps <= average <= high_fps:
+        video_problems.append(f'{average:.5g} fps (needs {low_fps}-{high_fps})')
+    elif real and average and abs(real - average) > 0.05 * average:
+        video_problems.append('variable frame rate')
+    width, height = _display_size(video)
+    narrow, wide = UPLOAD_SPEC['aspect']
+    if width and height and not narrow - 0.005 <= width / height <= wide + 0.005:
+        video_problems.append(f'{width}x{height} aspect ratio')
+    if width and height and min(width, height) < UPLOAD_SPEC['min_side']:
+        video_problems.append(f'{width}x{height} too small')
+    if not video_problems:
+        # Only worth reading the whole file when nothing else already
+        # forces a re-encode
+        gap = max_keyframe_gap(path, duration)
+        if gap > UPLOAD_SPEC['max_keyframe_gap']:
+            video_problems.append(f'keyframes {gap:.0f} s apart')
+    if audio is not None:
+        issues = []
+        profile = audio.get('profile') or 'LC'
+        if audio.get('codec_name') != 'aac' or profile != 'LC':
+            issues.append(profile if audio.get('codec_name') == 'aac'
+                          else audio.get('codec_name'))
+        rate = int(audio.get('sample_rate') or 0)
+        if rate and rate != UPLOAD_SPEC['audio_rate']:
+            issues.append(f'{rate / 1000:g} kHz')
+        if int(audio.get('channels') or 2) != 2:
+            issues.append(f"{audio.get('channels')} channels")
+        bitrate = int(audio.get('bit_rate') or 0)
+        if bitrate and bitrate < UPLOAD_SPEC['audio_min_bitrate']:
+            issues.append(f'{bitrate // 1000} kbps')
+        if issues:
+            audio_problems.append('audio ' + ', '.join(issues))
+    return video_problems, audio_problems
+
+
+def _upload_filters(video):
+    """-vf filters bringing a video inside UPLOAD_SPEC's frame rate, size
+    and aspect ratio (applied after ffmpeg's automatic rotation), and the
+    output frame rate."""
+    filters = []
+    low_fps, high_fps = UPLOAD_SPEC['fps']
+    real, average = _fps(video.get('r_frame_rate')), _fps(video.get('avg_frame_rate'))
+    out_fps = average or 30
+    variable = real and average and abs(real - average) > 0.05 * average
+    if variable or not low_fps <= out_fps <= high_fps:
+        out_fps = min(max(round(out_fps), low_fps), high_fps)
+        filters.append(f'fps={out_fps}')
+    width, height = _display_size(video)
+    if width and height:
+        short = min(width, height)
+        if short < UPLOAD_SPEC['min_side']:
+            scale = UPLOAD_SPEC['min_side'] / short
+            width, height = (round(width * scale / 2) * 2, round(height * scale / 2) * 2)
+            filters.append(f'scale={width}:{height}')
+        narrow, wide = UPLOAD_SPEC['aspect']
+        if width / height > wide + 0.005:      # wider than 16:9: bars top and bottom
+            height = -(-int(width / wide) // 2) * 2
+            filters.append(f'pad={width}:{height}:0:(oh-ih)/2:black')
+        elif width / height < narrow - 0.005:  # taller than 9:16: bars at the sides
+            width = -(-int(height * narrow) // 2) * 2
+            filters.append(f'pad={width}:{height}:(ow-iw)/2:0:black')
+        if width % 2 or height % 2:
+            filters.append('scale=trunc(iw/2)*2:trunc(ih/2)*2')
+        filters.append('setsar=1')
+    return filters, out_fps
+
+
+def _analyze(path, target):
+    """Probe a file: (metadata, video, audio, duration, problems, video
+    needs re-encoding, audio needs re-encoding)."""
     spec = CONVERT_TARGETS[target]
-    progress = progress or (lambda fraction: None)
     try:
         metadata = _ffmpeg_tools().get_metadata_object(path)
     except Exception as e:
@@ -958,29 +1092,65 @@ def convert_media(path, out_path, target='h264', progress=None, announce=None):
     audio = next((st for st in streams if st.get('codec_type') == 'audio'), None)
     if video is None:
         raise NotAVideoError('no video stream')
-    convert_video = video.get('codec_name') != spec['codec']
-    convert_audio = audio is not None and audio.get('codec_name') != 'aac'
-    same_container = (os.path.splitext(path)[1].lower()
-                      == os.path.splitext(out_path)[1].lower())
-    if not (convert_video or convert_audio) and same_container:
-        return None
-
-    changes = [f"{video.get('codec_name')} video"] if convert_video else []
-    if convert_audio:
-        changes.append(f"{audio.get('codec_name')} audio")
-    if announce:
-        announce(' and '.join(changes) or 'container')
     try:
         duration = float((metadata.get('format') or {}).get('duration') or 0)
     except ValueError:
         duration = 0
-    audio_opts = ['-c:a', 'aac', '-b:a', '192k'] if convert_audio else ['-c:a', 'copy']
+    if spec.get('upload_spec'):
+        video_problems, audio_problems = _upload_problems(video, audio, duration, path)
+    else:
+        video_problems = ([f"{video.get('codec_name')} video"]
+                          if video.get('codec_name') != spec['codec'] else [])
+        audio_problems = ([f"{audio.get('codec_name')} audio"]
+                          if audio is not None and audio.get('codec_name') != 'aac' else [])
+    return (metadata, video, audio, duration, video_problems + audio_problems,
+            bool(video_problems), bool(audio_problems))
+
+
+def conversion_problems(path, target):
+    """What a conversion to target would fix in path ([] = nothing)."""
+    return _analyze(path, target)[4]
+
+
+def convert_media(path, out_path, target='h264', progress=None, announce=None):
+    """Write the video at path, converted to a CONVERT_TARGETS format, to
+    out_path.
+
+    Streams that already meet the target are copied, not re-encoded.
+    Returns the encoder used ('copy' when only the container or audio
+    changed), or None - writing nothing - when the file already is in the
+    target format. announce(description of what gets fixed) is called
+    before any work starts. Raises NotAVideoError for files without a
+    video stream and ConversionError when every encoder fails.
+    """
+    spec = CONVERT_TARGETS[target]
+    progress = progress or (lambda fraction: None)
+    (metadata, video, audio, duration, problems,
+     convert_video, convert_audio) = _analyze(path, target)
+    same_container = (os.path.splitext(path)[1].lower()
+                      == os.path.splitext(out_path)[1].lower())
+    if not (convert_video or convert_audio) and same_container:
+        return None
+    if announce:
+        announce(' and '.join(problems) or 'container')
+
+    if convert_audio:
+        audio_opts = ['-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2']
+    else:
+        audio_opts = ['-c:a', 'copy']
     common = ['-i', path, '-map', '0:v:0', '-map', '0:a:0?', '-map_metadata', '0',
               *audio_opts, '-movflags', '+faststart']
     if convert_video:
         rate = _rate_options(conversion_bitrate(
             video, metadata.get('format') or {}, target))
-        encoders = [(name, [*opts, *rate, '-pix_fmt', 'yuv420p'], opts)
+        shaping = ['-pix_fmt', 'yuv420p']
+        if spec.get('upload_spec'):
+            filters, out_fps = _upload_filters(video)
+            if filters:
+                shaping += ['-vf', ','.join(filters)]
+            # Closed GOPs of 2 s: a keyframe every 2 seconds
+            shaping += ['-g', str(max(1, round(out_fps * UPLOAD_SPEC['keyframe_every'])))]
+        encoders = [(name, [*opts, *rate, *shaping], opts)
                     for name, opts in spec['encoders']]
     else:
         encoders = [('copy', ['-c:v', 'copy'], None)]
@@ -1059,12 +1229,12 @@ class CompatibleVideoPostProcessor(PostProcessor):
             percent = int(fraction * 100)
             if percent != shown[0]:
                 shown[0] = percent
-                self._status('Converting video to H.264 for compatibility... '
+                self._status('Converting to H.264 + AAC for compatibility... '
                              f'{percent}%')
 
         def announce(what):
             self.to_screen(f'Converting {what} to H.264/AAC for compatibility')
-            self._status('Converting video to H.264 for compatibility...')
+            self._status('Converting to H.264 + AAC for compatibility...')
 
         try:
             if convert_media(path, out_path, 'h264', progress, announce):
@@ -2265,8 +2435,16 @@ class DownstreamApp:
             self._convert_running = True
         threading.Thread(target=self._conversion_worker, daemon=True).start()
 
+    @staticmethod
+    def _duration(path):
+        try:
+            return float(_ffmpeg_tools().get_metadata_object(path)
+                         .get('format', {}).get('duration') or 0)
+        except Exception:
+            return 0.0
+
     def _conversion_worker(self):
-        converted, skipped, failed = [], [], []
+        converted, skipped, failed, long_videos = [], [], [], []
         number = 0
         while True:
             with self._convert_lock:
@@ -2293,11 +2471,22 @@ class DownstreamApp:
                                     f"{prefix} to {label}... {percent}%")
 
             out_path = conversion_output_path(path, target)
-            if os.path.exists(out_path):
-                skipped.append(f"{name}: already converted "
-                               f"({os.path.basename(out_path)})")
-                continue
             try:
+                # A copy made by an older version may not meet today's
+                # spec; those are converted again (and replaced)
+                if (os.path.exists(out_path)
+                        and not conversion_problems(out_path, target)):
+                    skipped.append(f"{name}: already converted "
+                                   f"({os.path.basename(out_path)})")
+                    continue
+            except ConversionError:
+                pass
+            try:
+                if CONVERT_TARGETS[target].get('upload_spec'):
+                    seconds = self._duration(path)
+                    if seconds > UPLOAD_SPEC['reel_max_seconds']:
+                        long_videos.append(
+                            f"{name} ({int(seconds // 60)}:{int(seconds % 60):02d})")
                 if convert_media(path, out_path, target, progress) is None:
                     skipped.append(f"{name}: already {label}")
                 else:
@@ -2322,8 +2511,14 @@ class DownstreamApp:
         self.root.after(0, self.status_var.set, summary)
         if converted:
             self.root.after(0, self.flash_status)
-        if skipped or failed:
-            details = "\n".join(failed + skipped)
+        notes = failed + skipped
+        if long_videos:
+            notes.append(
+                f"\nLonger than {UPLOAD_SPEC['reel_max_seconds']} seconds - Facebook "
+                "rejects these as Reels (e.g. in Meta Business Suite); trim them "
+                "or post them as a regular video:\n" + "\n".join(long_videos))
+        if notes:
+            details = "\n".join(notes)
             show = messagebox.showerror if failed else messagebox.showinfo
             self.root.after(0, lambda: show("Convert Files", f"{summary}\n\n{details}"))
 
